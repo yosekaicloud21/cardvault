@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Character Card Index Server
+Character Card Index Server - SQLite Edition
 Monitors folders for character cards, indexes metadata, serves search API.
 Auto-deletes prohibited content and detects duplicates.
+
+Uses SQLite + FTS5 for fast full-text search at scale (200k+ cards).
 
 Configuration via environment variables:
   CARD_DIRS           - Colon-separated list of directories to index
@@ -10,11 +12,7 @@ Configuration via environment variables:
   CARD_PORT           - Port to bind to (default: 8787)
   CARD_AUTO_DELETE    - Auto-delete prohibited content (default: true)
   CARD_DETECT_DUPES   - Detect duplicates (default: true)
-
-Example:
-  export CARD_DIRS="/data/cards/chub:/data/cards/booru"
-  export CARD_PORT=8787
-  python server.py
+  CARD_DB_FILE        - SQLite database file (default: /var/lib/card-index/cards.db)
 """
 
 import os
@@ -27,10 +25,13 @@ import hashlib
 import asyncio
 import logging
 import subprocess
+import sqlite3
+import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, asdict, field
+from contextlib import contextmanager
 from io import BytesIO
 
 try:
@@ -40,7 +41,8 @@ try:
 except ImportError:
     IMAGE_HASH_AVAILABLE = False
     logging.warning("imagehash/Pillow not installed - image duplicate detection disabled")
-from watchdog.observers import Observer
+
+from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileDeletedEvent, FileMovedEvent
 
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form
@@ -56,8 +58,10 @@ PORT = int(os.environ.get("CARD_PORT", "8787"))
 RECURSIVE = os.environ.get("CARD_RECURSIVE", "true").lower() == "true"
 AUTO_DELETE_PROHIBITED = os.environ.get("CARD_AUTO_DELETE", "true").lower() == "true"
 DETECT_DUPLICATES = os.environ.get("CARD_DETECT_DUPES", "true").lower() == "true"
-NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")  # Nextcloud user to scan (optional)
-INDEX_FILE = os.environ.get("CARD_INDEX_FILE", "/var/lib/card-index/index.json")  # Persistent index
+NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
+DB_FILE = os.environ.get("CARD_DB_FILE", "/var/lib/card-index/cards.db")
+RESCAN_ON_STARTUP = os.environ.get("CARD_RESCAN_STARTUP", "false").lower() == "true"
+WATCH_FILES = os.environ.get("CARD_WATCH_FILES", "true").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -71,8 +75,8 @@ BLOCKED_TAGS_EXACT = {
 }
 BLOCKED_PATTERNS = [re.compile(r'\bloli'), re.compile(r'\bshota'), re.compile(r'\brape')]
 
-# Additional patterns for description scanning (word boundaries to reduce false positives)
-BLOCKED_DESCRIPTION_PATTERNS = [
+# Additional patterns for description scanning (strict - always block)
+BLOCKED_DESCRIPTION_PATTERNS_STRICT = [
     re.compile(r'\b(underage|under-age|under age)\b', re.IGNORECASE),
     re.compile(r'\b(child|children|kid|kids)\b.*\b(sex|rape|nsfw|erotic|lewd)\b', re.IGNORECASE),
     re.compile(r'\b(sex|rape|nsfw|erotic|lewd)\b.*\b(child|children|kid|kids)\b', re.IGNORECASE),
@@ -82,9 +86,33 @@ BLOCKED_DESCRIPTION_PATTERNS = [
     re.compile(r'\bpedophil', re.IGNORECASE),
     re.compile(r'\bminor\b.*\b(sex|sexual|rape|erotic)\b', re.IGNORECASE),
     re.compile(r'\b(preteen|pre-teen)\b', re.IGNORECASE),
-    re.compile(r'\bage\s*[:\-]?\s*([1-9]|1[0-7])\b', re.IGNORECASE),  # Age: 1-17
-    re.compile(r'\b([1-9]|1[0-7])[-\s]*(years?|yrs?|y/?o)[-\s]*old\b', re.IGNORECASE),  # X years old / X-year-old (1-17)
 ]
+
+# Context-sensitive age patterns (need additional analysis)
+AGE_PATTERNS_CONTEXT = [
+    re.compile(r'\bage\s*[:\-]?\s*([1-9]|1[0-7])\b', re.IGNORECASE),
+    re.compile(r'\b([1-9]|1[0-7])[-\s]*(years?|yrs?|y/?o)[-\s]*old\b', re.IGNORECASE),
+    re.compile(r'\b(is|being|currently|now)\s+([1-9]|1[0-7])(\s|$)', re.IGNORECASE),
+]
+
+# Whitelist patterns - age mentions that are usually safe
+AGE_WHITELIST_PATTERNS = [
+    re.compile(r'\b(\d+)\s*years?\s*ago\b', re.IGNORECASE),  # "5 years ago"
+    re.compile(r'\bfor\s+(\d+)\s*years?\b', re.IGNORECASE),  # "for 10 years"
+    re.compile(r'\b(was|were|at|when|since)\s+(age\s+)?([1-9]|1[0-7])\b', re.IGNORECASE),  # past tense
+    re.compile(r'\b(grew up|raised|born|childhood|backstory|history)\b', re.IGNORECASE),  # backstory context
+]
+
+# Adult age patterns - if present, minor age mentions might be backstory
+ADULT_AGE_PATTERNS = [
+    re.compile(r'\bage\s*[:\-]?\s*(1[89]|[2-9]\d|\d{3,})\b', re.IGNORECASE),  # age: 18+
+    re.compile(r'\b(1[89]|[2-9]\d)[-\s]*(years?|yrs?|y/?o)[-\s]*old\b', re.IGNORECASE),  # "25 years old"
+    re.compile(r'\b(is|currently|now)\s+(1[89]|[2-9]\d)\b', re.IGNORECASE),  # "is 25"
+    re.compile(r'\b(adult|mature|grown|elderly|ancient|immortal|ageless)\b', re.IGNORECASE),
+]
+
+# Legacy combined list for backwards compatibility
+BLOCKED_DESCRIPTION_PATTERNS = BLOCKED_DESCRIPTION_PATTERNS_STRICT + AGE_PATTERNS_CONTEXT
 
 # NSFW tag indicators
 NSFW_TAGS = {
@@ -98,7 +126,7 @@ NSFW_TAGS = {
     "gore", "violence", "torture", "snuff",
     "rape", "non-con", "noncon", "dubcon", "dub-con",
     "futanari", "futa", "dickgirl",
-    "furry", "kemono", "anthro",  # Often NSFW
+    "furry", "kemono", "anthro",
     "monster", "tentacle", "oviposition", "vore",
     "femdom", "maledom", "cuckold", "ntr",
     "ahegao", "gangbang", "orgy", "threesome",
@@ -127,40 +155,36 @@ NSFW_DESCRIPTION_PATTERNS = [
     re.compile(r'\b(horny|aroused|turned on|in heat)\b', re.IGNORECASE),
 ]
 
+
 def name_similarity(name1: str, name2: str) -> float:
     """Check if two names are similar enough to be considered the same character."""
-    # Normalize names
     n1 = re.sub(r'[^a-z0-9\s]', '', name1.lower()).split()
     n2 = re.sub(r'[^a-z0-9\s]', '', name2.lower()).split()
 
     if not n1 or not n2:
         return 0.0
 
-    # Check for common significant words (ignore short words like "the", "a", etc.)
     significant1 = {w for w in n1 if len(w) > 2}
     significant2 = {w for w in n2 if len(w) > 2}
 
     if not significant1 or not significant2:
-        # Fall back to first word comparison
         return 1.0 if n1[0] == n2[0] else 0.0
 
-    # Calculate overlap
     common = significant1 & significant2
     if common:
         return len(common) / min(len(significant1), len(significant2))
 
     return 0.0
 
-def check_prohibited_tags(tags: List[str]) -> tuple[bool, set]:
-    """Check if tags contain prohibited content. Returns (is_prohibited, matched_tags)."""
+
+def check_prohibited_tags(tags: List[str]) -> Tuple[bool, set]:
+    """Check if tags contain prohibited content."""
     tags_lower = [t.lower() for t in tags]
     blocked_found = set()
 
     for tag in tags_lower:
-        # Check exact matches
         if tag in BLOCKED_TAGS_EXACT:
             blocked_found.add(tag)
-        # Check pattern matches (loli, shota, rape variants)
         else:
             for pattern in BLOCKED_PATTERNS:
                 if pattern.search(tag):
@@ -170,8 +194,8 @@ def check_prohibited_tags(tags: List[str]) -> tuple[bool, set]:
     return bool(blocked_found), blocked_found
 
 
-def check_prohibited_description(description: str) -> tuple[bool, set]:
-    """Check if description contains prohibited content. Returns (is_prohibited, matched_phrases)."""
+def check_prohibited_description(description: str) -> Tuple[bool, set]:
+    """Check if description contains prohibited content."""
     if not description:
         return False, set()
 
@@ -180,7 +204,6 @@ def check_prohibited_description(description: str) -> tuple[bool, set]:
     for pattern in BLOCKED_DESCRIPTION_PATTERNS:
         match = pattern.search(description)
         if match:
-            # Extract a snippet around the match for logging
             start = max(0, match.start() - 20)
             end = min(len(description), match.end() + 20)
             snippet = description[start:end].replace('\n', ' ')
@@ -189,33 +212,113 @@ def check_prohibited_description(description: str) -> tuple[bool, set]:
     return bool(blocked_found), blocked_found
 
 
-def check_prohibited_content(tags: List[str], description: str = "", first_mes: str = "") -> tuple[bool, set]:
-    """Check tags and description for prohibited content. Returns (is_prohibited, matched_items)."""
+def check_prohibited_content(tags: List[str], description: str = "", first_mes: str = "") -> Tuple[bool, set]:
+    """Check tags and description for prohibited content."""
     blocked_found = set()
 
-    # Check tags
     tag_prohibited, tag_matches = check_prohibited_tags(tags)
     blocked_found.update(tag_matches)
 
-    # Check description
     desc_prohibited, desc_matches = check_prohibited_description(description)
     blocked_found.update(desc_matches)
 
-    # Check first message too
     first_mes_prohibited, first_mes_matches = check_prohibited_description(first_mes)
+
+
+def check_prohibited_content_smart(tags: List[str], description: str = "", first_mes: str = "",
+                                    personality: str = "", scenario: str = "") -> Tuple[str, set, str]:
+    """
+    Smart context-aware prohibited content check.
+
+    Returns: (status, matches, reason)
+        status: "block" | "quarantine" | "safe"
+        matches: set of matched patterns
+        reason: human-readable explanation
+    """
+    blocked_found = set()
+    full_text = f"{description} {first_mes} {personality} {scenario}"
+
+    # Check tags first - exact tag matches are always blocked
+    tag_prohibited, tag_matches = check_prohibited_tags(tags)
+    if tag_prohibited:
+        return "block", tag_matches, "Prohibited tags found"
+
+    # Check strict patterns - always block
+    for pattern in BLOCKED_DESCRIPTION_PATTERNS_STRICT:
+        match = pattern.search(full_text)
+        if match:
+            start = max(0, match.start() - 30)
+            end = min(len(full_text), match.end() + 30)
+            snippet = full_text[start:end].replace('\n', ' ')
+            blocked_found.add(f"...{snippet}...")
+
+    if blocked_found:
+        return "block", blocked_found, "Strict prohibited content pattern"
+
+    # Check context-sensitive age patterns
+    age_matches = []
+    for pattern in AGE_PATTERNS_CONTEXT:
+        for match in pattern.finditer(full_text):
+            age_matches.append((match.start(), match.end(), match.group()))
+
+    if not age_matches:
+        return "safe", set(), "No prohibited content found"
+
+    # Check if adult age is mentioned (suggests minor age is backstory)
+    has_adult_age = any(p.search(full_text) for p in ADULT_AGE_PATTERNS)
+
+    # Check for whitelist patterns near the age mention
+    has_whitelist_context = any(p.search(full_text) for p in AGE_WHITELIST_PATTERNS)
+
+    # Analyze each age match
+    for start, end, matched_text in age_matches:
+        # Get surrounding context (100 chars each side)
+        context_start = max(0, start - 100)
+        context_end = min(len(full_text), end + 100)
+        context = full_text[context_start:context_end].lower()
+
+        # Check if this specific mention has whitelist context
+        local_whitelist = any(p.search(context) for p in AGE_WHITELIST_PATTERNS)
+        local_adult = any(p.search(context) for p in ADULT_AGE_PATTERNS)
+
+        if local_whitelist or local_adult:
+            # Likely backstory context
+            continue
+
+        # Check for explicit NSFW context near the age
+        nsfw_near_age = any(p.search(context) for p in NSFW_DESCRIPTION_PATTERNS[:10])
+
+        if nsfw_near_age:
+            blocked_found.add(f"Minor age + NSFW context: ...{context[50:150]}...")
+            return "block", blocked_found, "Minor age mentioned in NSFW context"
+
+    # If we found age mentions but also adult age or whitelist patterns
+    if age_matches and (has_adult_age or has_whitelist_context):
+        snippets = {f"Age mention (likely backstory): {m[2]}" for m in age_matches[:3]}
+        return "safe", snippets, "Minor age appears to be backstory (adult age also present)"
+
+    # Age mention without clear context - quarantine for review
+    if age_matches:
+        snippets = set()
+        for start, end, matched_text in age_matches[:3]:
+            context_start = max(0, start - 40)
+            context_end = min(len(full_text), end + 40)
+            snippet = full_text[context_start:context_end].replace('\n', ' ')
+            snippets.add(f"...{snippet}...")
+        return "quarantine", snippets, "Minor age mentioned - needs manual review"
+
+    return "safe", set(), "No prohibited content found"
     blocked_found.update(first_mes_matches)
 
     return bool(blocked_found), blocked_found
 
 
 def check_nsfw_content(tags: List[str], description: str = "", first_mes: str = "") -> bool:
-    """Check if content should be marked as NSFW based on tags and description."""
-    # Check tags
+    """Check if content should be marked as NSFW."""
     tags_lower = {t.lower() for t in tags}
     if tags_lower & NSFW_TAGS:
         return True
 
-    # Check description for NSFW patterns
     text_to_check = f"{description} {first_mes}"
     for pattern in NSFW_DESCRIPTION_PATTERNS:
         if pattern.search(text_to_check):
@@ -223,8 +326,10 @@ def check_nsfw_content(tags: List[str], description: str = "", first_mes: str = 
 
     return False
 
+
 @dataclass
 class CardEntry:
+    """Card data structure - matches original API response format."""
     file: str
     path: str
     folder: str
@@ -235,111 +340,229 @@ class CardEntry:
     description_preview: str
     first_mes_preview: str
     indexed_at: str
-    content_hash: str = ""  # Hash of character definition for duplicate detection
-    image_hash: str = ""    # Perceptual hash of image for visual duplicate detection
+    content_hash: str = ""
+    image_hash: str = ""
 
-class CardIndex:
-    def __init__(self):
-        self.cards: dict[str, CardEntry] = {}
-        self.lock = asyncio.Lock()
-        # Track prohibited deletions and duplicates
-        self.prohibited_deleted: List[dict] = []
-        self.duplicates: dict[str, List[str]] = {}  # content_hash -> [paths]
-        self.content_hashes: dict[str, str] = {}  # content_hash -> first_path
-        # Image-based duplicates
-        self.image_duplicates: dict[str, List[str]] = {}  # image_hash -> [paths]
-        self.image_hashes: dict[str, str] = {}  # image_hash -> first_path
-        self.image_hash_objects: dict[str, 'imagehash.ImageHash'] = {}  # path -> hash object
-        # Ignored duplicates (persisted) - set of frozensets of paths that are NOT duplicates
-        self.ignored_duplicates: set[frozenset] = set()
+
+class CardIndexDB:
+    """SQLite-based card index with FTS5 full-text search."""
+
+    def __init__(self, db_path: str = DB_FILE):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._local = threading.local()
+
+        # In-memory caches for image hash comparison (needed for fuzzy matching)
+        self.image_hash_objects: Dict[str, Any] = {}
+
         # Scan status
         self.scan_status = {"running": False, "progress": 0, "total": 0, "last_scan": None}
 
-    def save_index(self, filepath: str = INDEX_FILE):
-        """Save index to JSON file for persistence."""
+        # Initialize database
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get thread-local database connection."""
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._local.conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrent read/write
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        return self._local.conn
+
+    @contextmanager
+    def _cursor(self):
+        """Context manager for database cursor."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
         try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-            data = {
-                "version": 3,
-                "saved_at": datetime.utcnow().isoformat(),
-                "cards": {path: asdict(entry) for path, entry in self.cards.items()},
-                "content_hashes": self.content_hashes,
-                "image_hashes": self.image_hashes,
-                "duplicates": self.duplicates,
-                "image_duplicates": self.image_duplicates,
-                "prohibited_deleted": self.prohibited_deleted[-1000:],  # Keep last 1000
-                "ignored_duplicates": [list(s) for s in self.ignored_duplicates]  # Convert frozensets to lists for JSON
-            }
-
-            with open(filepath, 'w') as f:
-                json.dump(data, f)
-
-            logger.info(f"Saved index with {len(self.cards)} cards to {filepath}")
-            return True
+            yield cursor
+            conn.commit()
         except Exception as e:
-            logger.error(f"Failed to save index: {e}")
-            return False
+            conn.rollback()
+            raise e
 
-    def load_index(self, filepath: str = INDEX_FILE) -> bool:
-        """Load index from JSON file."""
-        try:
-            if not os.path.exists(filepath):
-                logger.info(f"No existing index file at {filepath}")
-                return False
+    def _init_db(self):
+        """Initialize database schema."""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-            with open(filepath, 'r') as f:
-                data = json.load(f)
+        with self._cursor() as cur:
+            # Main cards table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT UNIQUE NOT NULL,
+                    file TEXT NOT NULL,
+                    folder TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    creator TEXT DEFAULT 'Unknown',
+                    tags TEXT DEFAULT '[]',
+                    nsfw INTEGER DEFAULT 0,
+                    description_preview TEXT DEFAULT '',
+                    first_mes_preview TEXT DEFAULT '',
+                    indexed_at TEXT NOT NULL,
+                    content_hash TEXT DEFAULT '',
+                    image_hash TEXT DEFAULT '',
+                    file_mtime REAL DEFAULT 0
+                )
+            """)
 
-            # Load cards
-            for path, entry_dict in data.get("cards", {}).items():
-                # Verify file still exists
-                if os.path.exists(path):
-                    self.cards[path] = CardEntry(**entry_dict)
+            # FTS5 virtual table for full-text search
+            cur.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS cards_fts USING fts5(
+                    name,
+                    creator,
+                    description_preview,
+                    tags_text,
+                    content='cards',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                )
+            """)
 
-            # Load hashes and duplicates
-            self.content_hashes = data.get("content_hashes", {})
-            self.image_hashes = data.get("image_hashes", {})
-            self.duplicates = data.get("duplicates", {})
-            self.image_duplicates = data.get("image_duplicates", {})
-            self.prohibited_deleted = data.get("prohibited_deleted", [])
-            # Load ignored duplicates (convert lists back to frozensets)
-            self.ignored_duplicates = {frozenset(paths) for paths in data.get("ignored_duplicates", [])}
+            # Triggers to keep FTS in sync
+            cur.execute("""
+                CREATE TRIGGER IF NOT EXISTS cards_ai AFTER INSERT ON cards BEGIN
+                    INSERT INTO cards_fts(rowid, name, creator, description_preview, tags_text)
+                    VALUES (new.id, new.name, new.creator, new.description_preview, new.tags);
+                END
+            """)
 
-            # Clean up any self-duplicates (bug fix)
-            for hash_key in list(self.duplicates.keys()):
-                paths = self.duplicates[hash_key]
-                # Remove duplicates where path appears multiple times
-                unique_paths = list(dict.fromkeys(paths))
-                if len(unique_paths) < 2:
-                    del self.duplicates[hash_key]
-                else:
-                    self.duplicates[hash_key] = unique_paths
+            cur.execute("""
+                CREATE TRIGGER IF NOT EXISTS cards_ad AFTER DELETE ON cards BEGIN
+                    INSERT INTO cards_fts(cards_fts, rowid, name, creator, description_preview, tags_text)
+                    VALUES ('delete', old.id, old.name, old.creator, old.description_preview, old.tags);
+                END
+            """)
 
-            for hash_key in list(self.image_duplicates.keys()):
-                paths = self.image_duplicates[hash_key]
-                unique_paths = list(dict.fromkeys(paths))
-                if len(unique_paths) < 2:
-                    del self.image_duplicates[hash_key]
-                else:
-                    self.image_duplicates[hash_key] = unique_paths
+            cur.execute("""
+                CREATE TRIGGER IF NOT EXISTS cards_au AFTER UPDATE ON cards BEGIN
+                    INSERT INTO cards_fts(cards_fts, rowid, name, creator, description_preview, tags_text)
+                    VALUES ('delete', old.id, old.name, old.creator, old.description_preview, old.tags);
+                    INSERT INTO cards_fts(rowid, name, creator, description_preview, tags_text)
+                    VALUES (new.id, new.name, new.creator, new.description_preview, new.tags);
+                END
+            """)
 
-            logger.info(f"Loaded index with {len(self.cards)} cards from {filepath} (saved {data.get('saved_at', 'unknown')})")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load index: {e}")
-            return False
+            # Prohibited deletions log
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS prohibited_deleted (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    tags TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL
+                )
+            """)
+
+            # Ignored duplicates
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ignored_duplicates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paths_hash TEXT UNIQUE NOT NULL,
+                    paths TEXT NOT NULL
+                )
+            """)
+
+            # Import quarantine - cards flagged for manual review
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS import_quarantine (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_path TEXT UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
+                    creator TEXT DEFAULT 'Unknown',
+                    status TEXT DEFAULT 'pending',
+                    reason TEXT DEFAULT '',
+                    matches TEXT DEFAULT '[]',
+                    scanned_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    decision TEXT
+                )
+            """)
+
+            # Import scan results cache
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS import_scan_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_dir TEXT NOT NULL,
+                    scanned_at TEXT NOT NULL,
+                    total_files INTEGER DEFAULT 0,
+                    new_cards INTEGER DEFAULT 0,
+                    duplicates INTEGER DEFAULT 0,
+                    prohibited INTEGER DEFAULT 0,
+                    quarantined INTEGER DEFAULT 0,
+                    results TEXT DEFAULT '{}'
+                )
+            """)
+
+            # Indexes for fast lookups
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_content_hash ON cards(content_hash)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_image_hash ON cards(image_hash)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_folder ON cards(folder)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_creator ON cards(creator)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_nsfw ON cards(nsfw)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_path ON cards(path)")
+
+        logger.info(f"Database initialized at {self.db_path}")
+
+    def _row_to_entry(self, row: sqlite3.Row) -> CardEntry:
+        """Convert database row to CardEntry."""
+        tags = json.loads(row['tags']) if row['tags'] else []
+        return CardEntry(
+            file=row['file'],
+            path=row['path'],
+            folder=row['folder'],
+            name=row['name'],
+            creator=row['creator'],
+            tags=tags,
+            nsfw=bool(row['nsfw']),
+            description_preview=row['description_preview'],
+            first_mes_preview=row['first_mes_preview'],
+            indexed_at=row['indexed_at'],
+            content_hash=row['content_hash'] or '',
+            image_hash=row['image_hash'] or ''
+        )
+
+    def get_card_count(self) -> int:
+        """Get total number of indexed cards."""
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM cards")
+            return cur.fetchone()[0]
+
+    def get_card_by_path(self, path: str) -> Optional[CardEntry]:
+        """Get card by file path."""
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM cards WHERE path = ?", (path,))
+            row = cur.fetchone()
+            return self._row_to_entry(row) if row else None
+
+    def get_all_cards(self) -> Dict[str, CardEntry]:
+        """Get all cards as dict (for compatibility)."""
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM cards")
+            return {row['path']: self._row_to_entry(row) for row in cur.fetchall()}
+
+    def card_exists(self, path: str) -> bool:
+        """Check if card exists in index."""
+        with self._cursor() as cur:
+            cur.execute("SELECT 1 FROM cards WHERE path = ? LIMIT 1", (path,))
+            return cur.fetchone() is not None
+
+    def get_file_mtime(self, path: str) -> Optional[float]:
+        """Get stored file modification time."""
+        with self._cursor() as cur:
+            cur.execute("SELECT file_mtime FROM cards WHERE path = ?", (path,))
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def calculate_image_hash(self, filepath: str) -> Optional[str]:
-        """Calculate perceptual hash of image for visual duplicate detection."""
+        """Calculate perceptual hash of image."""
         if not IMAGE_HASH_AVAILABLE:
             return None
         try:
             with Image.open(filepath) as img:
-                # Use difference hash (fast and effective)
                 phash = imagehash.dhash(img, hash_size=12)
-                # Store the hash object for fuzzy matching
                 self.image_hash_objects[filepath] = phash
                 return str(phash)
         except Exception as e:
@@ -347,13 +570,12 @@ class CardIndex:
             return None
 
     def find_similar_image(self, filepath: str, hash_obj, threshold: int = 12) -> Optional[str]:
-        """Find an existing card with a similar image hash (within Hamming distance threshold)."""
+        """Find existing card with similar image hash."""
         if not IMAGE_HASH_AVAILABLE:
             return None
         for existing_path, existing_hash in self.image_hash_objects.items():
             if existing_path == filepath:
                 continue
-            # Calculate Hamming distance
             distance = hash_obj - existing_hash
             if distance <= threshold:
                 return existing_path
@@ -393,8 +615,34 @@ class CardIndex:
             logger.error(f"Error extracting metadata from {filepath}: {e}")
             return None
 
+    def add_prohibited_deleted(self, path: str, tags: List[str]):
+        """Log a prohibited card deletion."""
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO prohibited_deleted (path, tags, deleted_at) VALUES (?, ?, ?)",
+                (path, json.dumps(list(tags)), datetime.utcnow().isoformat())
+            )
+
+    def get_prohibited_deleted(self, limit: int = 100) -> List[dict]:
+        """Get list of prohibited deleted cards."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT path, tags, deleted_at FROM prohibited_deleted ORDER BY id DESC LIMIT ?",
+                (limit,)
+            )
+            return [
+                {"path": row[0], "tags": json.loads(row[1]), "deleted_at": row[2]}
+                for row in cur.fetchall()
+            ]
+
+    def get_prohibited_count(self) -> int:
+        """Get count of prohibited deletions."""
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM prohibited_deleted")
+            return cur.fetchone()[0]
+
     def index_card(self, filepath: str, delete_prohibited: bool = True) -> Optional[CardEntry]:
-        """Index a single card file. Returns None if prohibited/deleted or invalid."""
+        """Index a single card file."""
         metadata = self.extract_metadata(filepath)
         if not metadata:
             return None
@@ -404,16 +652,12 @@ class CardIndex:
         description = data.get("description", "")
         first_mes = data.get("first_mes", "")
 
-        # Check for prohibited content in tags, description, and first message
+        # Check for prohibited content
         if AUTO_DELETE_PROHIBITED or delete_prohibited:
             is_prohibited, blocked_items = check_prohibited_content(tags, description, first_mes)
             if is_prohibited:
                 logger.warning(f"PROHIBITED: {filepath} - Matches: {blocked_items}")
-                self.prohibited_deleted.append({
-                    "path": filepath,
-                    "tags": list(blocked_items),
-                    "deleted_at": datetime.utcnow().isoformat()
-                })
+                self.add_prohibited_deleted(filepath, blocked_items)
                 try:
                     os.remove(filepath)
                     logger.info(f"DELETED prohibited: {filepath}")
@@ -421,17 +665,15 @@ class CardIndex:
                     logger.error(f"Failed to delete {filepath}: {e}")
                 return None
 
-        # Determine NSFW from tags and description content
+        # Determine NSFW
         nsfw = check_nsfw_content(tags, description, first_mes)
 
-        # Get folder name (chub/booru)
         folder = Path(filepath).parent.name
         filename = Path(filepath).name
 
-        # Calculate content hash for duplicate detection
+        # Calculate content hash
         content_hash = ""
         if DETECT_DUPLICATES:
-            # Hash the core character definition
             hash_content = json.dumps({
                 "name": data.get("name", ""),
                 "description": description,
@@ -441,56 +683,16 @@ class CardIndex:
             }, sort_keys=True)
             content_hash = hashlib.md5(hash_content.encode()).hexdigest()
 
-            # Check for content duplicates
-            if content_hash in self.content_hashes:
-                original_path = self.content_hashes[content_hash]
-                # Don't mark as duplicate of itself
-                if original_path != filepath:
-                    if content_hash not in self.duplicates:
-                        self.duplicates[content_hash] = [original_path]
-                    if filepath not in self.duplicates[content_hash]:
-                        self.duplicates[content_hash].append(filepath)
-                        logger.info(f"CONTENT DUPLICATE: {filepath} matches {original_path}")
-            else:
-                self.content_hashes[content_hash] = filepath
-
-        # Calculate image hash for visual duplicate detection
+        # Calculate image hash
         image_hash = ""
-        card_name = data.get("name", filename.replace(".png", ""))
         if IMAGE_HASH_AVAILABLE:
             image_hash = self.calculate_image_hash(filepath) or ""
-            hash_obj = self.image_hash_objects.get(filepath)
 
-            if image_hash and hash_obj:
-                # First check exact match
-                match_path = None
-                match_key = image_hash
-
-                if image_hash in self.image_hashes:
-                    match_path = self.image_hashes[image_hash]
-                else:
-                    # Check for fuzzy match (Hamming distance <= 12)
-                    similar_path = self.find_similar_image(filepath, hash_obj, threshold=12)
-                    if similar_path:
-                        match_path = similar_path
-                        # Use the original's hash as the key for grouping
-                        original_entry = self.cards.get(similar_path)
-                        if original_entry and original_entry.image_hash:
-                            match_key = original_entry.image_hash
-
-                if match_path and match_path != filepath:
-                    original_entry = self.cards.get(match_path)
-                    original_name = original_entry.name if original_entry else ""
-
-                    # Only count as duplicate if names are similar (>0.3 similarity)
-                    if name_similarity(card_name, original_name) > 0.3:
-                        if match_key not in self.image_duplicates:
-                            self.image_duplicates[match_key] = [match_path]
-                        if filepath not in self.image_duplicates[match_key]:
-                            self.image_duplicates[match_key].append(filepath)
-                            logger.info(f"IMAGE DUPLICATE: {filepath} ({card_name}) matches {match_path} ({original_name})")
-                elif not match_path:
-                    self.image_hashes[image_hash] = filepath
+        # Get file modification time
+        try:
+            file_mtime = os.path.getmtime(filepath)
+        except:
+            file_mtime = 0
 
         entry = CardEntry(
             file=filename,
@@ -507,6 +709,20 @@ class CardIndex:
             image_hash=image_hash
         )
 
+        # Insert or update in database
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT OR REPLACE INTO cards
+                (path, file, folder, name, creator, tags, nsfw, description_preview,
+                 first_mes_preview, indexed_at, content_hash, image_hash, file_mtime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entry.path, entry.file, entry.folder, entry.name, entry.creator,
+                json.dumps(entry.tags), int(entry.nsfw), entry.description_preview,
+                entry.first_mes_preview, entry.indexed_at, entry.content_hash,
+                entry.image_hash, file_mtime
+            ))
+
         return entry
 
     async def add_card(self, filepath: str):
@@ -516,22 +732,32 @@ class CardIndex:
 
         entry = self.index_card(filepath)
         if entry:
-            async with self.lock:
-                self.cards[filepath] = entry
             logger.info(f"Indexed: {entry.name} ({entry.file})")
 
     async def remove_card(self, filepath: str):
         """Remove a card from the index."""
-        async with self.lock:
-            if filepath in self.cards:
-                del self.cards[filepath]
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM cards WHERE path = ?", (filepath,))
+            if cur.rowcount > 0:
                 logger.info(f"Removed from index: {filepath}")
+
+        # Also remove from image hash cache
+        if filepath in self.image_hash_objects:
+            del self.image_hash_objects[filepath]
 
     async def full_scan(self, directories: List[str], recursive: bool = True):
         """Perform full scan of directories."""
         logger.info(f"Starting full index scan (recursive={recursive})...")
         count = 0
         processed = 0
+
+        # Get existing paths to detect removed files
+        existing_paths = set()
+        with self._cursor() as cur:
+            cur.execute("SELECT path FROM cards")
+            existing_paths = {row[0] for row in cur.fetchall()}
+
+        found_paths = set()
 
         for directory in directories:
             if not os.path.exists(directory):
@@ -540,19 +766,30 @@ class CardIndex:
 
             if recursive:
                 for root, dirs, files in os.walk(directory):
-                    # Yield after each directory to keep server responsive
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)  # Yield to keep server responsive
                     for filename in files:
                         if filename.lower().endswith('.png'):
                             filepath = os.path.join(root, filename)
+                            found_paths.add(filepath)
                             processed += 1
                             self.scan_status["progress"] = processed
+
+                            # Check if file needs re-indexing
+                            try:
+                                file_mtime = os.path.getmtime(filepath)
+                                stored_mtime = self.get_file_mtime(filepath)
+
+                                if stored_mtime is not None and abs(file_mtime - stored_mtime) < 1:
+                                    # File unchanged, skip
+                                    count += 1
+                                    continue
+                            except:
+                                pass
+
                             entry = self.index_card(filepath)
                             if entry:
-                                self.cards[filepath] = entry
                                 count += 1
                                 if count % 100 == 0:
-                                    # Yield frequently to keep server responsive
                                     await asyncio.sleep(0)
                                 if count % 5000 == 0:
                                     logger.info(f"Indexed {count} cards...")
@@ -560,18 +797,39 @@ class CardIndex:
                 for filename in os.listdir(directory):
                     if filename.lower().endswith('.png'):
                         filepath = os.path.join(directory, filename)
+                        found_paths.add(filepath)
                         processed += 1
                         self.scan_status["progress"] = processed
+
+                        try:
+                            file_mtime = os.path.getmtime(filepath)
+                            stored_mtime = self.get_file_mtime(filepath)
+
+                            if stored_mtime is not None and abs(file_mtime - stored_mtime) < 1:
+                                count += 1
+                                continue
+                        except:
+                            pass
+
                         entry = self.index_card(filepath)
                         if entry:
-                            self.cards[filepath] = entry
                             count += 1
                             if count % 100 == 0:
                                 await asyncio.sleep(0)
                             if count % 5000 == 0:
                                 logger.info(f"Indexed {count} cards...")
 
-        logger.info(f"Full scan complete. Total cards indexed: {len(self.cards)}")
+        # Remove cards that no longer exist on disk
+        removed_paths = existing_paths - found_paths
+        if removed_paths:
+            logger.info(f"Removing {len(removed_paths)} cards no longer on disk...")
+            with self._cursor() as cur:
+                for path in removed_paths:
+                    cur.execute("DELETE FROM cards WHERE path = ?", (path,))
+                    if path in self.image_hash_objects:
+                        del self.image_hash_objects[path]
+
+        logger.info(f"Full scan complete. Total cards indexed: {self.get_card_count()}")
 
     def search(
         self,
@@ -582,52 +840,483 @@ class CardIndex:
         folder: Optional[str] = None,
         limit: int = 50,
         offset: int = 0
-    ) -> tuple[List[CardEntry], int]:
-        """Search the index with filters."""
-        results = list(self.cards.values())
+    ) -> Tuple[List[CardEntry], int]:
+        """Search the index with filters using FTS5."""
 
-        # Filter by query (name, description)
+        conditions = []
+        params = []
+
+        # Use FTS5 for text search
         if query:
-            query_lower = query.lower()
-            results = [
-                c for c in results
-                if query_lower in c.name.lower()
-                or query_lower in c.description_preview.lower()
-                or query_lower in c.creator.lower()
-            ]
+            # Escape special FTS5 characters and create search query
+            safe_query = query.replace('"', '""')
+            conditions.append("cards.id IN (SELECT rowid FROM cards_fts WHERE cards_fts MATCH ?)")
+            # Use prefix search for partial matching
+            params.append(f'"{safe_query}"*')
 
-        # Filter by tags
+        # Tag filtering
         if tags:
-            tags_lower = [t.lower() for t in tags]
-            results = [
-                c for c in results
-                if any(t.lower() in tags_lower for t in c.tags)
-            ]
+            for tag in tags:
+                conditions.append("cards.tags LIKE ?")
+                params.append(f'%"{tag}"%')
 
-        # Filter by NSFW
+        # NSFW filter
         if nsfw is not None:
-            results = [c for c in results if c.nsfw == nsfw]
+            conditions.append("cards.nsfw = ?")
+            params.append(int(nsfw))
 
-        # Filter by creator
+        # Creator filter
         if creator:
-            creator_lower = creator.lower()
-            results = [c for c in results if creator_lower in c.creator.lower()]
+            conditions.append("cards.creator LIKE ?")
+            params.append(f'%{creator}%')
 
-        # Filter by folder
+        # Folder filter
         if folder:
-            results = [c for c in results if c.folder == folder]
+            conditions.append("cards.folder = ?")
+            params.append(folder)
 
-        total = len(results)
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        # Paginate
-        results = results[offset:offset + limit]
+        with self._cursor() as cur:
+            # Get total count
+            cur.execute(f"SELECT COUNT(*) FROM cards WHERE {where_clause}", params)
+            total = cur.fetchone()[0]
+
+            # Get paginated results
+            cur.execute(
+                f"SELECT * FROM cards WHERE {where_clause} ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
+                params + [limit, offset]
+            )
+            results = [self._row_to_entry(row) for row in cur.fetchall()]
 
         return results, total
+
+    def get_duplicates(self) -> Dict[str, List[str]]:
+        """Get content hash duplicates."""
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT content_hash, GROUP_CONCAT(path, '|||') as paths
+                FROM cards
+                WHERE content_hash != ''
+                GROUP BY content_hash
+                HAVING COUNT(*) > 1
+            """)
+            return {
+                row[0]: row[1].split('|||')
+                for row in cur.fetchall()
+            }
+
+    def get_image_duplicates(self) -> Dict[str, List[str]]:
+        """Get image hash duplicates."""
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT image_hash, GROUP_CONCAT(path, '|||') as paths
+                FROM cards
+                WHERE image_hash != ''
+                GROUP BY image_hash
+                HAVING COUNT(*) > 1
+            """)
+            return {
+                row[0]: row[1].split('|||')
+                for row in cur.fetchall()
+            }
+
+    def is_duplicate_ignored(self, paths: List[str]) -> bool:
+        """Check if duplicate group is ignored."""
+        paths_hash = hashlib.md5(json.dumps(sorted(paths)).encode()).hexdigest()
+        with self._cursor() as cur:
+            cur.execute("SELECT 1 FROM ignored_duplicates WHERE paths_hash = ?", (paths_hash,))
+            return cur.fetchone() is not None
+
+    def ignore_duplicate(self, paths: List[str]):
+        """Mark duplicate group as ignored."""
+        paths_hash = hashlib.md5(json.dumps(sorted(paths)).encode()).hexdigest()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO ignored_duplicates (paths_hash, paths) VALUES (?, ?)",
+                (paths_hash, json.dumps(paths))
+            )
+
+    def delete_card(self, path: str) -> bool:
+        """Delete a card from disk and index."""
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            with self._cursor() as cur:
+                cur.execute("DELETE FROM cards WHERE path = ?", (path,))
+            if path in self.image_hash_objects:
+                del self.image_hash_objects[path]
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete {path}: {e}")
+            return False
+
+    def get_stats(self) -> dict:
+        """Get index statistics."""
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM cards")
+            total = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM cards WHERE nsfw = 1")
+            nsfw_count = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(DISTINCT creator) FROM cards")
+            unique_creators = cur.fetchone()[0]
+
+            cur.execute("SELECT folder, COUNT(*) FROM cards GROUP BY folder")
+            folders = {row[0]: row[1] for row in cur.fetchall()}
+
+            # Top creators
+            cur.execute("""
+                SELECT creator, COUNT(*) as cnt FROM cards
+                GROUP BY creator ORDER BY cnt DESC LIMIT 50
+            """)
+            top_creators = [(row[0], row[1]) for row in cur.fetchall()]
+
+        return {
+            "total_cards": total,
+            "nsfw_count": nsfw_count,
+            "sfw_count": total - nsfw_count,
+            "unique_creators": unique_creators,
+            "folders": folders,
+            "top_creators": top_creators
+        }
+
+    def get_all_tags(self) -> List[Tuple[str, int]]:
+        """Get all tags with counts."""
+        all_tags = {}
+        with self._cursor() as cur:
+            cur.execute("SELECT tags FROM cards")
+            for row in cur.fetchall():
+                tags = json.loads(row[0]) if row[0] else []
+                for tag in tags:
+                    all_tags[tag] = all_tags.get(tag, 0) + 1
+
+        return sorted(all_tags.items(), key=lambda x: x[1], reverse=True)
+
+    def save_index(self, filepath: str = None):
+        """No-op for compatibility - SQLite auto-persists."""
+        logger.info("Index auto-saved (SQLite)")
+        return True
+
+    def load_index(self, filepath: str = None) -> bool:
+        """Check if database has data."""
+        return self.get_card_count() > 0
+
+    # ===== IMPORT METHODS =====
+
+    def scan_source_for_import(self, source_dir: str, recursive: bool = True) -> Dict[str, Any]:
+        """
+        Scan a source directory and categorize cards for import.
+        Does NOT modify source or destination - read-only scan.
+
+        Returns dict with:
+            - new_cards: list of cards that can be imported
+            - duplicates: list of cards that already exist
+            - prohibited: list of cards blocked by strict rules
+            - quarantine: list of cards needing manual review
+        """
+        results = {
+            "source_dir": source_dir,
+            "scanned_at": datetime.utcnow().isoformat(),
+            "total_files": 0,
+            "new_cards": [],
+            "duplicates": [],
+            "prohibited": [],
+            "quarantine": [],
+            "errors": []
+        }
+
+        if not os.path.exists(source_dir):
+            results["errors"].append(f"Directory not found: {source_dir}")
+            return results
+
+        # Get existing hashes for duplicate detection
+        existing_content_hashes = set()
+        existing_image_hashes = set()
+        with self._cursor() as cur:
+            cur.execute("SELECT content_hash FROM cards WHERE content_hash != ''")
+            existing_content_hashes = {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT image_hash FROM cards WHERE image_hash != ''")
+            existing_image_hashes = {row[0] for row in cur.fetchall()}
+
+        # Scan source directory
+        files_to_scan = []
+        if recursive:
+            for root, dirs, files in os.walk(source_dir):
+                for filename in files:
+                    if filename.lower().endswith('.png'):
+                        files_to_scan.append(os.path.join(root, filename))
+        else:
+            for filename in os.listdir(source_dir):
+                if filename.lower().endswith('.png'):
+                    files_to_scan.append(os.path.join(source_dir, filename))
+
+        results["total_files"] = len(files_to_scan)
+
+        for filepath in files_to_scan:
+            try:
+                card_info = self._analyze_card_for_import(
+                    filepath,
+                    existing_content_hashes,
+                    existing_image_hashes
+                )
+
+                if card_info["status"] == "new":
+                    results["new_cards"].append(card_info)
+                elif card_info["status"] == "duplicate":
+                    results["duplicates"].append(card_info)
+                elif card_info["status"] == "prohibited":
+                    results["prohibited"].append(card_info)
+                elif card_info["status"] == "quarantine":
+                    results["quarantine"].append(card_info)
+                    # Also save to quarantine table
+                    self._add_to_quarantine(card_info)
+
+            except Exception as e:
+                results["errors"].append(f"{filepath}: {str(e)}")
+
+        # Cache results
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT INTO import_scan_cache
+                (source_dir, scanned_at, total_files, new_cards, duplicates, prohibited, quarantined, results)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                source_dir,
+                results["scanned_at"],
+                results["total_files"],
+                len(results["new_cards"]),
+                len(results["duplicates"]),
+                len(results["prohibited"]),
+                len(results["quarantine"]),
+                json.dumps(results)
+            ))
+
+        return results
+
+    def _analyze_card_for_import(self, filepath: str,
+                                  existing_content_hashes: set,
+                                  existing_image_hashes: set) -> Dict[str, Any]:
+        """Analyze a single card for import eligibility."""
+        metadata = self.extract_metadata(filepath)
+
+        card_info = {
+            "path": filepath,
+            "file": Path(filepath).name,
+            "folder": Path(filepath).parent.name,
+            "status": "new",
+            "reason": "",
+            "matches": []
+        }
+
+        if not metadata:
+            card_info["status"] = "error"
+            card_info["reason"] = "No valid metadata"
+            return card_info
+
+        data = metadata.get("data", metadata)
+        tags = data.get("tags", [])
+        description = data.get("description", "")
+        first_mes = data.get("first_mes", "")
+        personality = data.get("personality", "")
+        scenario = data.get("scenario", "")
+
+        card_info["name"] = data.get("name", card_info["file"].replace(".png", ""))
+        card_info["creator"] = data.get("creator", "Unknown")
+        card_info["tags"] = tags
+        card_info["nsfw"] = check_nsfw_content(tags, description, first_mes)
+
+        # Calculate content hash
+        hash_content = json.dumps({
+            "name": data.get("name", ""),
+            "description": description,
+            "first_mes": first_mes,
+            "personality": personality,
+            "scenario": scenario
+        }, sort_keys=True)
+        content_hash = hashlib.md5(hash_content.encode()).hexdigest()
+        card_info["content_hash"] = content_hash
+
+        # Check for content duplicate
+        if content_hash in existing_content_hashes:
+            card_info["status"] = "duplicate"
+            card_info["reason"] = "Content hash already exists"
+            return card_info
+
+        # Calculate image hash
+        if IMAGE_HASH_AVAILABLE:
+            try:
+                with Image.open(filepath) as img:
+                    phash = imagehash.dhash(img, hash_size=12)
+                    image_hash = str(phash)
+                    card_info["image_hash"] = image_hash
+
+                    if image_hash in existing_image_hashes:
+                        card_info["status"] = "duplicate"
+                        card_info["reason"] = "Image hash already exists"
+                        return card_info
+            except Exception as e:
+                card_info["image_hash"] = ""
+
+        # Smart prohibited content check
+        status, matches, reason = check_prohibited_content_smart(
+            tags, description, first_mes, personality, scenario
+        )
+
+        if status == "block":
+            card_info["status"] = "prohibited"
+            card_info["reason"] = reason
+            card_info["matches"] = list(matches)
+        elif status == "quarantine":
+            card_info["status"] = "quarantine"
+            card_info["reason"] = reason
+            card_info["matches"] = list(matches)
+        # else: status remains "new"
+
+        return card_info
+
+    def _add_to_quarantine(self, card_info: Dict[str, Any]):
+        """Add a card to the quarantine table for manual review."""
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT OR REPLACE INTO import_quarantine
+                (source_path, name, creator, status, reason, matches, scanned_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?)
+            """, (
+                card_info["path"],
+                card_info.get("name", ""),
+                card_info.get("creator", "Unknown"),
+                card_info.get("reason", ""),
+                json.dumps(card_info.get("matches", [])),
+                datetime.utcnow().isoformat()
+            ))
+
+    def get_quarantine_list(self, status: str = None, limit: int = 100) -> List[Dict]:
+        """Get cards in quarantine."""
+        with self._cursor() as cur:
+            if status:
+                cur.execute(
+                    "SELECT * FROM import_quarantine WHERE status = ? ORDER BY scanned_at DESC LIMIT ?",
+                    (status, limit)
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM import_quarantine ORDER BY scanned_at DESC LIMIT ?",
+                    (limit,)
+                )
+            return [dict(row) for row in cur.fetchall()]
+
+    def review_quarantine_card(self, source_path: str, decision: str) -> bool:
+        """
+        Review a quarantined card.
+        decision: "approve" | "reject"
+        """
+        with self._cursor() as cur:
+            cur.execute("""
+                UPDATE import_quarantine
+                SET status = ?, reviewed_at = ?, decision = ?
+                WHERE source_path = ?
+            """, (
+                "reviewed",
+                datetime.utcnow().isoformat(),
+                decision,
+                source_path
+            ))
+            return cur.rowcount > 0
+
+    def execute_import(self, cards_to_import: List[str], destination_folder: str = None) -> Dict[str, Any]:
+        """
+        Actually import the specified cards.
+        cards_to_import: list of source file paths
+        destination_folder: subfolder name in CARD_DIRS[0] (default: source folder name)
+        """
+        results = {
+            "imported": [],
+            "failed": [],
+            "skipped": []
+        }
+
+        if not CARD_DIRS or not CARD_DIRS[0]:
+            results["failed"].append({"error": "No destination directory configured"})
+            return results
+
+        base_dir = CARD_DIRS[0]
+
+        for source_path in cards_to_import:
+            try:
+                if not os.path.exists(source_path):
+                    results["skipped"].append({
+                        "path": source_path,
+                        "reason": "Source file not found"
+                    })
+                    continue
+
+                # Determine destination
+                if destination_folder:
+                    dest_folder = destination_folder
+                else:
+                    dest_folder = Path(source_path).parent.name
+
+                # Sanitize folder name
+                safe_folder = "".join(c for c in dest_folder if c.isalnum() or c in " -_").strip() or "Imported"
+                dest_dir = os.path.join(base_dir, safe_folder)
+                os.makedirs(dest_dir, exist_ok=True)
+
+                # Copy file
+                dest_path = os.path.join(dest_dir, Path(source_path).name)
+
+                # Handle name collision
+                if os.path.exists(dest_path):
+                    base, ext = os.path.splitext(Path(source_path).name)
+                    counter = 1
+                    while os.path.exists(dest_path):
+                        dest_path = os.path.join(dest_dir, f"{base}_{counter}{ext}")
+                        counter += 1
+
+                shutil.copy2(source_path, dest_path)
+
+                # Index the new card
+                entry = self.index_card(dest_path, delete_prohibited=False)
+                if entry:
+                    results["imported"].append({
+                        "source": source_path,
+                        "destination": dest_path,
+                        "name": entry.name
+                    })
+                else:
+                    results["failed"].append({
+                        "path": source_path,
+                        "reason": "Failed to index after copy"
+                    })
+
+            except Exception as e:
+                results["failed"].append({
+                    "path": source_path,
+                    "reason": str(e)
+                })
+
+        return results
+
+    def get_last_import_scan(self, source_dir: str = None) -> Optional[Dict]:
+        """Get the last import scan results."""
+        with self._cursor() as cur:
+            if source_dir:
+                cur.execute(
+                    "SELECT results FROM import_scan_cache WHERE source_dir = ? ORDER BY scanned_at DESC LIMIT 1",
+                    (source_dir,)
+                )
+            else:
+                cur.execute(
+                    "SELECT results FROM import_scan_cache ORDER BY scanned_at DESC LIMIT 1"
+                )
+            row = cur.fetchone()
+            return json.loads(row[0]) if row else None
 
 
 # File watcher handler
 class CardFileHandler(FileSystemEventHandler):
-    def __init__(self, index: CardIndex, loop: asyncio.AbstractEventLoop):
+    def __init__(self, index: CardIndexDB, loop: asyncio.AbstractEventLoop):
         self.index = index
         self.loop = loop
 
@@ -655,7 +1344,7 @@ class CardFileHandler(FileSystemEventHandler):
 
 
 # FastAPI app
-app = FastAPI(title="Character Card Index", version="1.0.0")
+app = FastAPI(title="Character Card Index", version="2.0.0-sqlite")
 
 app.add_middleware(
     CORSMiddleware,
@@ -665,54 +1354,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-index = CardIndex()
+index = CardIndexDB()
 observer = None
+
+
+# Watcher status for dashboard
+watcher_status = {"state": "disabled", "directories": 0, "ready": False}
+
+def setup_watcher_background(loop):
+    """Set up file watcher in background thread using polling (no inotify limits)."""
+    global observer, watcher_status
+
+    try:
+        watcher_status["state"] = "initializing"
+        logger.info("File watcher initializing (polling mode)...")
+
+        handler = CardFileHandler(index, loop)
+        # PollingObserver checks for changes every few seconds
+        # No inotify limits - works with any number of directories
+        observer = PollingObserver(timeout=10)  # Check every 10 seconds
+
+        dir_count = 0
+        for directory in CARD_DIRS:
+            if os.path.exists(directory):
+                observer.schedule(handler, directory, recursive=RECURSIVE)
+                dir_count += 1
+                logger.info(f"Watching directory: {directory} (recursive={RECURSIVE}, polling mode)")
+
+        watcher_status["directories"] = dir_count
+        observer.start()
+        watcher_status["state"] = "active"
+        watcher_status["ready"] = True
+        logger.info(f"File watcher ready - polling {dir_count} directories every 10 seconds")
+
+    except Exception as e:
+        watcher_status["state"] = f"error: {e}"
+        logger.error(f"File watcher setup failed: {e}")
+
 
 @app.on_event("startup")
 async def startup():
     global observer
 
-    # Try to load existing index first for instant availability
-    if index.load_index():
-        logger.info("Server ready with cached index, starting background rescan...")
+    card_count = index.get_card_count()
+
+    # Start file watcher in background thread (non-blocking)
+    if WATCH_FILES:
+        loop = asyncio.get_event_loop()
+        # Run watcher setup in a thread so it doesn't block startup
+        import concurrent.futures
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(setup_watcher_background, loop)
+        watcher_msg = "file watcher starting in background"
     else:
-        logger.info("No cached index, performing initial scan...")
+        observer = None
+        watcher_status["state"] = "disabled"
+        watcher_msg = "file watcher disabled"
+        logger.info("File watching disabled (CARD_WATCH_FILES=false)")
 
-    # Start file watcher immediately
-    loop = asyncio.get_event_loop()
-    handler = CardFileHandler(index, loop)
-    observer = Observer()
+    # Only scan on startup if database is empty OR rescan is explicitly enabled
+    if card_count > 0 and not RESCAN_ON_STARTUP:
+        logger.info(f"Server ready with {card_count} cards in database ({watcher_msg})")
+        index.scan_status["last_scan"] = "cached"
+    else:
+        if card_count > 0:
+            logger.info(f"Server ready with {card_count} cards, starting background rescan (CARD_RESCAN_STARTUP=true)...")
+        else:
+            logger.info("Empty database, performing initial scan...")
+        asyncio.create_task(background_scan())
 
-    for directory in CARD_DIRS:
-        if os.path.exists(directory):
-            observer.schedule(handler, directory, recursive=RECURSIVE)
-            logger.info(f"Watching directory: {directory} (recursive={RECURSIVE})")
-
-    observer.start()
-
-    # Run full scan in background (updates/verifies index)
-    asyncio.create_task(background_scan())
 
 async def background_scan():
-    """Run full scan in background without blocking server startup."""
-    # Small delay to let server finish starting
+    """Run full scan in background."""
     await asyncio.sleep(0.1)
 
     try:
         index.scan_status["running"] = True
         index.scan_status["progress"] = 0
-        index.scan_status["total"] = 0  # Will update as we scan
+        index.scan_status["total"] = 0
 
-        logger.info(f"Background scan starting...")
-
-        # Perform scan
+        logger.info("Background scan starting...")
         await index.full_scan(CARD_DIRS, recursive=RECURSIVE)
 
         index.scan_status["running"] = False
         index.scan_status["last_scan"] = datetime.utcnow().isoformat()
-
-        # Save index after scan completes
-        index.save_index()
 
     except Exception as e:
         logger.error(f"Background scan error: {e}")
@@ -721,13 +1446,12 @@ async def background_scan():
 
 @app.on_event("shutdown")
 async def shutdown():
-    # Save index on shutdown
-    index.save_index()
-
     if observer:
         observer.stop()
         observer.join()
 
+
+# Dashboard HTML (same as original)
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -798,9 +1522,7 @@ DASHBOARD_HTML = """
         .btn-danger { background: #e74c3c; color: white; }
         .btn-danger:hover { background: #c0392b; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .search-box {
-            display: flex; gap: 10px; margin-bottom: 20px;
-        }
+        .search-box { display: flex; gap: 10px; margin-bottom: 20px; }
         .search-box input {
             flex: 1; padding: 12px; background: #0f3460; border: 1px solid #333;
             border-radius: 8px; color: #fff; font-size: 1rem;
@@ -840,9 +1562,7 @@ DASHBOARD_HTML = """
         }
         .dupe-group .type-badge.content { background: #667eea; }
         .dupe-group .type-badge.image { background: #e74c3c; }
-        .dupe-cards {
-            display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px;
-        }
+        .dupe-cards { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
         .dupe-card {
             background: #1a1a2e; border-radius: 8px; overflow: hidden;
             width: 140px; position: relative;
@@ -895,9 +1615,7 @@ DASHBOARD_HTML = """
             border: none; color: white; width: 36px; height: 36px; border-radius: 50%;
             cursor: pointer; font-size: 1.2rem; z-index: 10;
         }
-        .modal-header {
-            display: flex; gap: 20px; padding: 25px; border-bottom: 1px solid #333;
-        }
+        .modal-header { display: flex; gap: 20px; padding: 25px; border-bottom: 1px solid #333; }
         .modal-header img {
             width: 200px; height: 200px; object-fit: cover; border-radius: 12px;
             flex-shrink: 0;
@@ -925,14 +1643,10 @@ DASHBOARD_HTML = """
     <div class="container">
         <header>
             <h1>CardVault Dashboard</h1>
-            <p>Character Card Index Server v2.0.0</p>
+            <p>Character Card Index Server v2.0.0-sqlite</p>
             <div style="margin-top:15px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-                <button class="btn btn-primary" onclick="triggerRescan()" id="rescan-btn">
-                    🔄 Rescan Index
-                </button>
-                <button class="btn btn-primary" onclick="triggerNextcloudScan()" id="nextcloud-btn">
-                    ☁️ Refresh Nextcloud
-                </button>
+                <button class="btn btn-primary" onclick="triggerRescan()" id="rescan-btn">Rescan Index</button>
+                <button class="btn btn-primary" onclick="triggerNextcloudScan()" id="nextcloud-btn">Refresh Nextcloud</button>
                 <span id="scan-status" style="font-size:0.9rem;"></span>
             </div>
         </header>
@@ -944,6 +1658,7 @@ DASHBOARD_HTML = """
         <div class="tabs">
             <button class="tab active" data-tab="search">Search Cards</button>
             <button class="tab" data-tab="duplicates">Duplicates</button>
+            <button class="tab" data-tab="import">Import</button>
             <button class="tab" data-tab="prohibited">Prohibited Log</button>
             <button class="tab" data-tab="tags">Top Tags</button>
         </div>
@@ -963,14 +1678,10 @@ DASHBOARD_HTML = """
         <div id="duplicates" class="tab-content">
             <div class="section">
                 <h2>Duplicate Cards</h2>
-                <p style="color:#888;margin-bottom:15px;">Cards with identical content (same name, description, first message, personality, scenario)</p>
+                <p style="color:#888;margin-bottom:15px;">Cards with identical content</p>
                 <div class="actions" style="margin-bottom:20px;">
-                    <button class="btn btn-danger" onclick="cleanDuplicates('first')" id="clean-first-btn">
-                        Delete Duplicates (Keep First)
-                    </button>
-                    <button class="btn btn-danger" onclick="cleanDuplicates('largest')" id="clean-largest-btn">
-                        Delete Duplicates (Keep Largest)
-                    </button>
+                    <button class="btn btn-danger" onclick="cleanDuplicates('first')" id="clean-first-btn">Delete Duplicates (Keep First)</button>
+                    <button class="btn btn-danger" onclick="cleanDuplicates('largest')" id="clean-largest-btn">Delete Duplicates (Keep Largest)</button>
                 </div>
                 <div id="duplicates-list"></div>
                 <div id="duplicates-loading" class="loading">Loading duplicates...</div>
@@ -980,7 +1691,7 @@ DASHBOARD_HTML = """
         <div id="prohibited" class="tab-content">
             <div class="section">
                 <h2>Prohibited Content Log</h2>
-                <p style="color:#888;margin-bottom:15px;">Cards that were automatically deleted due to prohibited tags</p>
+                <p style="color:#888;margin-bottom:15px;">Cards automatically deleted</p>
                 <div id="prohibited-list"></div>
                 <div id="prohibited-loading" class="loading">Loading...</div>
             </div>
@@ -993,13 +1704,79 @@ DASHBOARD_HTML = """
                 <div id="tags-loading" class="loading">Loading tags...</div>
             </div>
         </div>
+
+        <div id="import" class="tab-content">
+            <div class="section">
+                <h2>Smart Import</h2>
+                <p style="color:#888;margin-bottom:15px;">Import cards from a source directory. Source files are never modified or deleted.</p>
+
+                <div class="search-box" style="margin-bottom:20px;">
+                    <input type="text" id="import-source-dir" placeholder="Source directory path (e.g., /mnt/backup/cards)">
+                    <label style="display:flex;align-items:center;gap:5px;color:#888;font-size:0.9rem;">
+                        <input type="checkbox" id="import-recursive" checked> Recursive
+                    </label>
+                    <button class="btn btn-primary" onclick="scanForImport()" id="import-scan-btn">Scan</button>
+                </div>
+
+                <div id="import-status" style="margin-bottom:15px;display:none;padding:10px;background:#0f3460;border-radius:8px;">
+                    <span id="import-status-text"></span>
+                </div>
+
+                <div id="import-results" style="display:none;">
+                    <div class="stats-grid" style="margin-bottom:20px;">
+                        <div class="stat-card success"><h3>New Cards</h3><div class="value" id="import-new-count">0</div></div>
+                        <div class="stat-card"><h3>Duplicates</h3><div class="value" id="import-dupe-count">0</div></div>
+                        <div class="stat-card danger"><h3>Prohibited</h3><div class="value" id="import-prohibited-count">0</div></div>
+                        <div class="stat-card warning"><h3>Needs Review</h3><div class="value" id="import-quarantine-count">0</div></div>
+                    </div>
+
+                    <div class="tabs" style="margin-bottom:15px;">
+                        <button class="tab active" onclick="showImportTab('new')">New Cards</button>
+                        <button class="tab" onclick="showImportTab('quarantine')">Needs Review</button>
+                        <button class="tab" onclick="showImportTab('prohibited')">Prohibited</button>
+                        <button class="tab" onclick="showImportTab('duplicates')">Duplicates</button>
+                    </div>
+
+                    <div id="import-new-section">
+                        <div class="actions" style="margin-bottom:15px;">
+                            <button class="btn btn-primary" onclick="importAllNew()" id="import-all-btn">Import All New Cards</button>
+                            <button class="btn btn-primary" onclick="importSelected()" id="import-selected-btn">Import Selected</button>
+                            <label style="display:flex;align-items:center;gap:5px;color:#888;">
+                                <input type="checkbox" id="import-select-all" onchange="toggleSelectAllImport()"> Select All
+                            </label>
+                        </div>
+                        <div id="import-new-list" class="card-grid"></div>
+                    </div>
+
+                    <div id="import-quarantine-section" style="display:none;">
+                        <div class="actions" style="margin-bottom:15px;">
+                            <button class="btn btn-primary" onclick="approveAllQuarantine()">Approve All</button>
+                            <button class="btn btn-danger" onclick="rejectAllQuarantine()">Reject All</button>
+                        </div>
+                        <div id="import-quarantine-list"></div>
+                    </div>
+
+                    <div id="import-prohibited-section" style="display:none;">
+                        <p style="color:#e74c3c;margin-bottom:15px;">These cards were blocked due to prohibited content and cannot be imported.</p>
+                        <div id="import-prohibited-list"></div>
+                    </div>
+
+                    <div id="import-duplicates-section" style="display:none;">
+                        <p style="color:#888;margin-bottom:15px;">These cards already exist in your collection.</p>
+                        <div id="import-duplicates-list"></div>
+                    </div>
+                </div>
+
+                <div id="import-loading" class="loading" style="display:none;">Scanning source directory...</div>
+            </div>
+        </div>
     </div>
 
     <div id="toast"></div>
 
     <div class="modal-overlay" id="card-modal" onclick="if(event.target===this)closeModal()">
         <div class="modal">
-            <button class="modal-close" onclick="closeModal()">✕</button>
+            <button class="modal-close" onclick="closeModal()">x</button>
             <div class="modal-header">
                 <img id="modal-img" src="" alt="">
                 <div class="modal-header-info">
@@ -1038,8 +1815,8 @@ DASHBOARD_HTML = """
                     <div class="modal-section-content" id="modal-path" style="font-family:monospace;font-size:0.85rem;"></div>
                 </div>
                 <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap;">
-                    <button class="btn btn-primary" id="modal-similar-btn" onclick="findSimilar()">🔍 Find Similar</button>
-                    <button class="btn btn-danger" id="modal-delete-btn" onclick="deleteFromModal()">🗑️ Delete Card</button>
+                    <button class="btn btn-primary" id="modal-similar-btn" onclick="findSimilar()">Find Similar</button>
+                    <button class="btn btn-danger" id="modal-delete-btn" onclick="deleteFromModal()">Delete Card</button>
                 </div>
                 <div id="similar-results" style="margin-top:20px; display:none;">
                     <h3 style="color:#888; font-size:0.9rem; margin-bottom:12px;">SIMILAR CARDS</h3>
@@ -1050,7 +1827,6 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
-        // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1060,7 +1836,6 @@ DASHBOARD_HTML = """
             });
         });
 
-        // Toast notification
         function showToast(msg, isError = false) {
             const toast = document.getElementById('toast');
             toast.textContent = msg;
@@ -1069,75 +1844,42 @@ DASHBOARD_HTML = """
             setTimeout(() => toast.style.display = 'none', 3000);
         }
 
-        // Load stats
         async function loadStats() {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 document.getElementById('stats-grid').innerHTML = `
-                    <div class="stat-card success">
-                        <h3>Total Cards</h3>
-                        <div class="value">${data.total_cards.toLocaleString()}</div>
-                    </div>
-                    <div class="stat-card">
-                        <h3>SFW Cards</h3>
-                        <div class="value">${data.sfw_count.toLocaleString()}</div>
-                    </div>
-                    <div class="stat-card warning">
-                        <h3>NSFW Cards</h3>
-                        <div class="value">${data.nsfw_count.toLocaleString()}</div>
-                    </div>
-                    <div class="stat-card">
-                        <h3>Unique Creators</h3>
-                        <div class="value">${data.unique_creators.toLocaleString()}</div>
-                    </div>
-                    <div class="stat-card warning">
-                        <h3>Content Dupes</h3>
-                        <div class="value">${data.content_duplicate_groups}</div>
-                    </div>
-                    <div class="stat-card" style="border-left-color:#e74c3c;">
-                        <h3>Image Dupes ${data.image_hash_enabled ? '' : '(disabled)'}</h3>
-                        <div class="value" style="color:#e74c3c;">${data.image_duplicate_groups}</div>
-                    </div>
-                    <div class="stat-card danger">
-                        <h3>Prohibited Deleted</h3>
-                        <div class="value">${data.prohibited_deleted}</div>
-                    </div>
+                    <div class="stat-card success"><h3>Total Cards</h3><div class="value">${data.total_cards.toLocaleString()}</div></div>
+                    <div class="stat-card"><h3>SFW Cards</h3><div class="value">${data.sfw_count.toLocaleString()}</div></div>
+                    <div class="stat-card warning"><h3>NSFW Cards</h3><div class="value">${data.nsfw_count.toLocaleString()}</div></div>
+                    <div class="stat-card"><h3>Unique Creators</h3><div class="value">${data.unique_creators.toLocaleString()}</div></div>
+                    <div class="stat-card warning"><h3>Content Dupes</h3><div class="value">${data.content_duplicate_groups}</div></div>
+                    <div class="stat-card" style="border-left-color:#e74c3c;"><h3>Image Dupes</h3><div class="value" style="color:#e74c3c;">${data.image_duplicate_groups}</div></div>
+                    <div class="stat-card danger"><h3>Prohibited Deleted</h3><div class="value">${data.prohibited_deleted}</div></div>
                 `;
-            } catch (e) {
-                console.error('Failed to load stats:', e);
-            }
+            } catch (e) { console.error('Failed to load stats:', e); }
         }
 
-        // Search cards
         async function searchCards() {
             const query = document.getElementById('search-input').value;
             const results = document.getElementById('search-results');
             const loading = document.getElementById('search-loading');
-
             results.innerHTML = '';
             loading.style.display = 'block';
-
             try {
                 const res = await fetch(`/api/cards?q=${encodeURIComponent(query)}&limit=100`);
                 const data = await res.json();
                 loading.style.display = 'none';
-
                 if (data.results.length === 0) {
                     results.innerHTML = '<div class="empty">No cards found</div>';
                     return;
                 }
-
                 results.innerHTML = data.results.map(card => `
                     <div class="card" style="position:relative;" data-folder="${encodeURIComponent(card.folder)}" data-file="${encodeURIComponent(card.file)}" onclick="openCardEl(this)">
-                        <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}"
-                             alt="${card.name}" loading="lazy"
+                        <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}" alt="${card.name}" loading="lazy"
                              onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/><text x=%2250%22 y=%2250%22 text-anchor=%22middle%22 fill=%22%23666%22>?</text></svg>'">
                         ${card.nsfw ? '<span class="nsfw-badge">NSFW</span>' : ''}
-                        <div class="card-info">
-                            <h4>${card.name}</h4>
-                            <p>${card.creator}</p>
-                        </div>
+                        <div class="card-info"><h4>${card.name}</h4><p>${card.creator}</p></div>
                     </div>
                 `).join('');
             } catch (e) {
@@ -1146,259 +1888,146 @@ DASHBOARD_HTML = """
             }
         }
 
-        // Load duplicates
         async function loadDuplicates() {
             const list = document.getElementById('duplicates-list');
             const loading = document.getElementById('duplicates-loading');
-
             try {
                 const res = await fetch('/api/duplicates');
                 const data = await res.json();
                 loading.style.display = 'none';
-
                 if (data.duplicates.length === 0) {
                     list.innerHTML = '<div class="empty">No duplicates found</div>';
                     return;
                 }
-
-                list.innerHTML = `
-                    <p style="margin-bottom:15px;">
-                        <span style="color:#667eea;">${data.content_duplicate_groups} content duplicates</span> |
-                        <span style="color:#e74c3c;">${data.image_duplicate_groups} image duplicates</span> |
-                        <span style="color:#f39c12;">${data.total_duplicate_files} extra files total</span>
-                    </p>
-                ` + data.duplicates.map((dupe, idx) => `
+                list.innerHTML = `<p style="margin-bottom:15px;"><span style="color:#667eea;">${data.content_duplicate_groups} content duplicates</span> | <span style="color:#e74c3c;">${data.image_duplicate_groups} image duplicates</span></p>` + data.duplicates.map((dupe, idx) => `
                     <div class="dupe-group" id="dupe-group-${idx}" data-paths="${encodeURIComponent(JSON.stringify(dupe.cards.map(c => c.path)))}">
-                        <button class="ignore-btn" onclick="ignoreDuplicateGroup(${idx})">✓ Not a Duplicate</button>
-                        <h4>${dupe.count} copies
-                            <span class="type-badge ${dupe.type}">${dupe.type === 'content' ? '📄 Content Match' : '🖼️ Image Match'}</span>
-                        </h4>
+                        <button class="ignore-btn" onclick="ignoreDuplicateGroup(${idx})">Not a Duplicate</button>
+                        <h4>${dupe.count} copies <span class="type-badge ${dupe.type}">${dupe.type === 'content' ? 'Content Match' : 'Image Match'}</span></h4>
                         <div class="dupe-cards">
                             ${dupe.cards.map((card, i) => `
                                 <div class="dupe-card" data-path="${encodeURIComponent(card.path)}" data-folder="${encodeURIComponent(card.folder)}" data-file="${encodeURIComponent(card.file)}">
                                     ${i === 0 ? '<span class="keep-badge">KEEP</span>' : ''}
-                                    <button class="delete-btn" onclick="event.stopPropagation(); deleteCardEl(this.parentElement)" title="Delete this card">✕</button>
-                                    <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}"
-                                         onclick="openCardEl(this.parentElement)"
-                                         onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/></svg>'"
-                                         loading="lazy">
-                                    <div class="info">
-                                        <h5>${card.name}</h5>
-                                        <p>${card.creator}</p>
-                                    </div>
+                                    <button class="delete-btn" onclick="event.stopPropagation(); deleteCardEl(this.parentElement)" title="Delete">x</button>
+                                    <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}" onclick="openCardEl(this.parentElement)" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/></svg>'" loading="lazy">
+                                    <div class="info"><h5>${card.name}</h5><p>${card.creator}</p></div>
                                 </div>
                             `).join('')}
                         </div>
-                        <div class="dupe-path" style="margin-top:8px;">${dupe.cards.map(c => c.path).join(' | ')}</div>
                     </div>
                 `).join('');
             } catch (e) {
                 loading.style.display = 'none';
                 list.innerHTML = '<div class="empty">Error loading duplicates</div>';
-                console.error(e);
             }
         }
 
-        // Helper to open card from element data attributes
         function openCardEl(el) {
             const folder = decodeURIComponent(el.dataset.folder);
             const file = decodeURIComponent(el.dataset.file);
             openCard(folder, file);
         }
 
-        // Helper to delete card from element data attributes
         function deleteCardEl(el) {
             const path = decodeURIComponent(el.dataset.path);
             deleteCardByPath(path, el);
         }
 
-        // Delete single card by path
         async function deleteCardByPath(path, card) {
             if (!confirm('Delete this card permanently?')) return;
-
             const btn = card.querySelector('.delete-btn');
-            if (btn) {
-                btn.disabled = true;
-                btn.textContent = '...';
-            }
-
+            if (btn) { btn.disabled = true; btn.textContent = '...'; }
             try {
                 const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
                 const data = await res.json();
-
                 if (data.success) {
                     card.classList.add('deleted');
                     showToast('Card deleted');
                     loadStats();
                 } else {
-                    showToast('Delete failed: ' + (data.detail || 'Unknown error'), true);
-                    if (btn) {
-                        btn.disabled = false;
-                        btn.textContent = '✕';
-                    }
+                    showToast('Delete failed', true);
+                    if (btn) { btn.disabled = false; btn.textContent = 'x'; }
                 }
             } catch (e) {
-                showToast('Delete error: ' + e.message, true);
-                if (btn) {
-                    btn.disabled = false;
-                    btn.textContent = '✕';
-                }
+                showToast('Delete error', true);
+                if (btn) { btn.disabled = false; btn.textContent = 'x'; }
             }
         }
 
-        // Delete single card (legacy, for search results)
-        async function deleteCard(path, btn) {
-            if (!confirm('Delete this card permanently?')) return;
-
-            const card = btn.closest('.dupe-card');
-            btn.disabled = true;
-            btn.textContent = '...';
-
-            try {
-                const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
-                const data = await res.json();
-
-                if (data.success) {
-                    card.classList.add('deleted');
-                    showToast('Card deleted');
-                    loadStats();
-                } else {
-                    showToast('Delete failed: ' + (data.detail || 'Unknown error'), true);
-                    btn.disabled = false;
-                    btn.textContent = '✕';
-                }
-            } catch (e) {
-                showToast('Delete error: ' + e.message, true);
-                btn.disabled = false;
-                btn.textContent = '✕';
-            }
-        }
-
-        // Mark duplicate group as not-a-duplicate
         async function ignoreDuplicateGroup(idx) {
             const group = document.getElementById('dupe-group-' + idx);
             const paths = JSON.parse(decodeURIComponent(group.dataset.paths));
             const btn = group.querySelector('.ignore-btn');
             btn.disabled = true;
             btn.textContent = 'Saving...';
-
             try {
                 const params = paths.map(p => 'paths=' + encodeURIComponent(p)).join('&');
                 const res = await fetch('/api/duplicates/ignore?' + params, { method: 'POST' });
-                const data = await res.json();
-
                 if (res.ok) {
                     group.style.opacity = '0.3';
-                    group.style.pointerEvents = 'none';
                     showToast('Marked as not a duplicate');
                     setTimeout(() => group.remove(), 1000);
                     loadStats();
                 } else {
-                    showToast('Failed: ' + (data.detail || 'Unknown error'), true);
+                    showToast('Failed', true);
                     btn.disabled = false;
-                    btn.textContent = '✓ Not a Duplicate';
+                    btn.textContent = 'Not a Duplicate';
                 }
             } catch (e) {
-                showToast('Error: ' + e.message, true);
+                showToast('Error', true);
                 btn.disabled = false;
-                btn.textContent = '✓ Not a Duplicate';
+                btn.textContent = 'Not a Duplicate';
             }
         }
 
-        // Clean duplicates
         async function cleanDuplicates(keep) {
-            if (!confirm(`Delete all duplicate files, keeping the ${keep} copy of each? This cannot be undone.`)) {
-                return;
-            }
-
+            if (!confirm(`Delete all duplicate files, keeping the ${keep} copy?`)) return;
             document.getElementById('clean-first-btn').disabled = true;
             document.getElementById('clean-largest-btn').disabled = true;
-
             try {
                 const res = await fetch(`/api/duplicates/clean?keep=${keep}`, { method: 'DELETE' });
                 const data = await res.json();
                 showToast(`Deleted ${data.deleted_count} duplicate files`);
                 loadDuplicates();
                 loadStats();
-            } catch (e) {
-                showToast('Error cleaning duplicates', true);
-            }
-
+            } catch (e) { showToast('Error cleaning duplicates', true); }
             document.getElementById('clean-first-btn').disabled = false;
             document.getElementById('clean-largest-btn').disabled = false;
         }
 
-        // Load prohibited
         async function loadProhibited() {
             const list = document.getElementById('prohibited-list');
             const loading = document.getElementById('prohibited-loading');
-
             try {
                 const res = await fetch('/api/prohibited');
                 const data = await res.json();
                 loading.style.display = 'none';
-
                 if (data.deleted.length === 0) {
-                    list.innerHTML = '<div class="empty">No prohibited cards have been deleted</div>';
+                    list.innerHTML = '<div class="empty">No prohibited cards deleted</div>';
                     return;
                 }
-
-                list.innerHTML = `
-                    <p style="margin-bottom:15px;">Total deleted: ${data.total_deleted}</p>
-                    <table>
-                        <thead><tr><th>Path</th><th>Blocked Tags</th><th>Deleted At</th></tr></thead>
-                        <tbody>
-                            ${data.deleted.map(item => `
-                                <tr>
-                                    <td style="font-family:monospace;font-size:0.85rem;">${item.path}</td>
-                                    <td>${item.tags.map(t => `<span class="tag blocked">${t}</span>`).join('')}</td>
-                                    <td>${new Date(item.deleted_at).toLocaleString()}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
+                list.innerHTML = `<p style="margin-bottom:15px;">Total: ${data.total_deleted}</p><table><thead><tr><th>Path</th><th>Blocked Tags</th><th>Deleted At</th></tr></thead><tbody>${data.deleted.map(item => `<tr><td style="font-family:monospace;font-size:0.85rem;">${item.path}</td><td>${item.tags.map(t => `<span class="tag blocked">${t}</span>`).join('')}</td><td>${new Date(item.deleted_at).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
             } catch (e) {
                 loading.style.display = 'none';
                 list.innerHTML = '<div class="empty">Error loading prohibited log</div>';
             }
         }
 
-        // Load tags
         async function loadTags() {
             const list = document.getElementById('tags-list');
             const loading = document.getElementById('tags-loading');
-
             try {
                 const res = await fetch('/api/tags');
                 const data = await res.json();
                 loading.style.display = 'none';
-
-                list.innerHTML = `
-                    <table>
-                        <thead><tr><th>Tag</th><th>Count</th></tr></thead>
-                        <tbody>
-                            ${data.tags.slice(0, 100).map(([tag, count]) => `
-                                <tr>
-                                    <td><span class="tag">${tag}</span></td>
-                                    <td>${count.toLocaleString()}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
+                list.innerHTML = `<table><thead><tr><th>Tag</th><th>Count</th></tr></thead><tbody>${data.tags.slice(0, 100).map(([tag, count]) => `<tr><td><span class="tag">${tag}</span></td><td>${count.toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
             } catch (e) {
                 loading.style.display = 'none';
                 list.innerHTML = '<div class="empty">Error loading tags</div>';
             }
         }
 
-        // Search on Enter
-        document.getElementById('search-input').addEventListener('keypress', e => {
-            if (e.key === 'Enter') searchCards();
-        });
+        document.getElementById('search-input').addEventListener('keypress', e => { if (e.key === 'Enter') searchCards(); });
 
-        // Card detail modal
         let currentCardPath = '';
 
         function closeModal() {
@@ -1408,279 +2037,470 @@ DASHBOARD_HTML = """
 
         async function findSimilar() {
             if (!currentCardPath) return;
-
             const btn = document.getElementById('modal-similar-btn');
             const resultsDiv = document.getElementById('similar-results');
             const cardsDiv = document.getElementById('similar-cards');
-
             btn.disabled = true;
-            btn.textContent = '🔍 Searching...';
+            btn.textContent = 'Searching...';
             resultsDiv.style.display = 'none';
-
             try {
                 const res = await fetch(`/api/cards/similar?path=${encodeURIComponent(currentCardPath)}&threshold=20`);
                 const data = await res.json();
-
                 if (data.similar.length === 0) {
                     cardsDiv.innerHTML = '<p style="color:#888;">No similar cards found</p>';
                 } else {
                     cardsDiv.innerHTML = data.similar.map(card => `
                         <div class="dupe-card" data-path="${encodeURIComponent(card.path)}" data-folder="${encodeURIComponent(card.folder)}" data-file="${encodeURIComponent(card.file)}">
-                            <button class="delete-btn" onclick="event.stopPropagation(); deleteCardEl(this.parentElement)" title="Delete">✕</button>
-                            <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}"
-                                 onclick="openCardEl(this.parentElement)"
-                                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/></svg>'"
-                                 loading="lazy">
-                            <div class="info">
-                                <h5>${card.name}</h5>
-                                <p>${card.creator}</p>
-                                <p style="color:#667eea;font-size:0.7rem;">${card.reasons.join(', ')}</p>
-                            </div>
+                            <button class="delete-btn" onclick="event.stopPropagation(); deleteCardEl(this.parentElement)" title="Delete">x</button>
+                            <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}" onclick="openCardEl(this.parentElement)" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/></svg>'" loading="lazy">
+                            <div class="info"><h5>${card.name}</h5><p>${card.creator}</p><p style="color:#667eea;font-size:0.7rem;">${card.reasons.join(', ')}</p></div>
                         </div>
                     `).join('');
                 }
-
                 resultsDiv.style.display = 'block';
                 showToast(`Found ${data.similar.length} similar cards`);
-            } catch (e) {
-                showToast('Search error: ' + e.message, true);
-            }
-
+            } catch (e) { showToast('Search error', true); }
             btn.disabled = false;
-            btn.textContent = '🔍 Find Similar';
+            btn.textContent = 'Find Similar';
         }
 
         async function deleteFromModal() {
             if (!currentCardPath) return;
             if (!confirm('Delete this card permanently?')) return;
-
             const btn = document.getElementById('modal-delete-btn');
             btn.disabled = true;
             btn.textContent = 'Deleting...';
-
             try {
                 const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(currentCardPath)}`, { method: 'DELETE' });
                 const data = await res.json();
-
                 if (data.success) {
                     showToast('Card deleted');
                     closeModal();
                     loadStats();
-                    searchCards(); // Refresh search results
+                    searchCards();
                     loadDuplicates();
-                } else {
-                    showToast('Delete failed', true);
-                }
-            } catch (e) {
-                showToast('Delete error', true);
-            }
+                } else { showToast('Delete failed', true); }
+            } catch (e) { showToast('Delete error', true); }
             btn.disabled = false;
-            btn.textContent = '🗑️ Delete Card';
+            btn.textContent = 'Delete Card';
         }
 
         async function openCard(folder, file) {
             const modal = document.getElementById('card-modal');
             modal.classList.add('active');
-
-            // Set image immediately
             document.getElementById('modal-img').src = `/cards/${encodeURIComponent(folder)}/${encodeURIComponent(file)}`;
             document.getElementById('modal-name').textContent = 'Loading...';
             document.getElementById('modal-creator').textContent = '';
             document.getElementById('modal-tags').innerHTML = '';
             document.getElementById('similar-results').style.display = 'none';
-            document.getElementById('similar-cards').innerHTML = '';
-
             try {
                 const res = await fetch(`/api/cards/${encodeURIComponent(folder)}/${encodeURIComponent(file)}`);
                 const data = await res.json();
                 const entry = data.entry;
                 const meta = data.full_metadata?.data || data.full_metadata || {};
-
                 document.getElementById('modal-name').textContent = entry.name || meta.name || file;
                 document.getElementById('modal-creator').textContent = entry.creator || meta.creator || 'Unknown';
                 document.getElementById('modal-folder').textContent = entry.folder + '/' + entry.file;
                 document.getElementById('modal-path').textContent = entry.path;
                 currentCardPath = entry.path;
-
-                // NSFW badge
-                const nsfwBadge = document.getElementById('modal-nsfw');
-                nsfwBadge.style.display = entry.nsfw ? 'inline-block' : 'none';
-
-                // Tags
+                document.getElementById('modal-nsfw').style.display = entry.nsfw ? 'inline-block' : 'none';
                 const tags = entry.tags || meta.tags || [];
-                document.getElementById('modal-tags').innerHTML = tags.slice(0, 20).map(t =>
-                    `<span class="tag">${t}</span>`
-                ).join('') + (tags.length > 20 ? `<span class="tag">+${tags.length - 20} more</span>` : '');
-
-                // Content sections
-                const desc = meta.description || entry.description_preview || '';
-                const firstMes = meta.first_mes || entry.first_mes_preview || '';
-                const personality = meta.personality || '';
-                const scenario = meta.scenario || '';
-                const mesExample = meta.mes_example || '';
-
-                setSection('description', desc);
-                setSection('firstmes', firstMes);
-                setSection('personality', personality);
-                setSection('scenario', scenario);
-                setSection('mesbefore', mesExample);
-
+                document.getElementById('modal-tags').innerHTML = tags.slice(0, 20).map(t => `<span class="tag">${t}</span>`).join('') + (tags.length > 20 ? `<span class="tag">+${tags.length - 20} more</span>` : '');
+                setSection('description', meta.description || entry.description_preview || '');
+                setSection('firstmes', meta.first_mes || entry.first_mes_preview || '');
+                setSection('personality', meta.personality || '');
+                setSection('scenario', meta.scenario || '');
+                setSection('mesbefore', meta.mes_example || '');
             } catch (e) {
                 document.getElementById('modal-name').textContent = 'Error loading card';
-                console.error(e);
             }
         }
 
         function setSection(id, content) {
             const section = document.getElementById('section-' + id);
             const el = document.getElementById('modal-' + id);
-            if (content && content.trim()) {
-                section.style.display = 'block';
-                el.textContent = content;
-            } else {
-                section.style.display = 'none';
-            }
+            if (content && content.trim()) { section.style.display = 'block'; el.textContent = content; }
+            else { section.style.display = 'none'; }
         }
 
-        // Close modal on Escape
-        document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') closeModal();
-        });
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-        // Nextcloud scan
         async function triggerNextcloudScan() {
             const btn = document.getElementById('nextcloud-btn');
-            const status = document.getElementById('nextcloud-status');
-
             btn.disabled = true;
-            btn.textContent = '☁️ Scanning...';
-            status.textContent = 'Scan in progress (this may take a while)...';
-            status.style.color = '#f39c12';
-
+            btn.textContent = 'Scanning...';
             try {
                 const res = await fetch('/api/nextcloud/scan', { method: 'POST' });
                 const data = await res.json();
-
-                if (data.success) {
-                    status.textContent = '✓ Scan completed successfully';
-                    status.style.color = '#2ecc71';
-                    showToast('Nextcloud scan completed!');
-                } else {
-                    status.textContent = '✗ Scan failed: ' + (data.error || data.stderr || 'Unknown error');
-                    status.style.color = '#e74c3c';
-                    showToast('Nextcloud scan failed', true);
-                }
-            } catch (e) {
-                status.textContent = '✗ Error: ' + e.message;
-                status.style.color = '#e74c3c';
-                showToast('Nextcloud scan error', true);
-            }
-
+                if (data.success) { showToast('Nextcloud scan completed!'); }
+                else { showToast('Nextcloud scan failed', true); }
+            } catch (e) { showToast('Nextcloud scan error', true); }
             btn.disabled = false;
-            btn.textContent = '☁️ Refresh Nextcloud';
+            btn.textContent = 'Refresh Nextcloud';
         }
 
-        // Index rescan
         async function triggerRescan() {
             const btn = document.getElementById('rescan-btn');
             btn.disabled = true;
-            btn.textContent = '🔄 Starting...';
-
+            btn.textContent = 'Starting...';
             try {
                 const res = await fetch('/api/index/rescan', { method: 'POST' });
-                if (res.ok) {
-                    showToast('Rescan started');
-                    checkScanStatus();
-                } else {
+                if (res.ok) { showToast('Rescan started'); checkScanStatus(); }
+                else {
                     const data = await res.json();
-                    showToast(data.detail || 'Failed to start rescan', true);
+                    showToast(data.detail || 'Failed', true);
                     btn.disabled = false;
-                    btn.textContent = '🔄 Rescan Index';
+                    btn.textContent = 'Rescan Index';
                 }
             } catch (e) {
-                showToast('Error: ' + e.message, true);
+                showToast('Error', true);
                 btn.disabled = false;
-                btn.textContent = '🔄 Rescan Index';
+                btn.textContent = 'Rescan Index';
             }
         }
 
-        // Check scan status
         async function checkScanStatus() {
             try {
                 const res = await fetch('/api/index/status');
                 const data = await res.json();
                 const status = document.getElementById('scan-status');
                 const btn = document.getElementById('rescan-btn');
-
                 if (data.scan_running) {
-                    const pct = data.scan_total > 0 ? Math.round(data.scan_progress / data.scan_total * 100) : 0;
-                    status.textContent = `Scanning... ${data.scan_progress}/${data.scan_total} (${pct}%)`;
+                    status.textContent = `Scanning... ${data.scan_progress} processed`;
                     status.style.color = '#f39c12';
                     btn.disabled = true;
-                    btn.textContent = '🔄 Scanning...';
-                    setTimeout(checkScanStatus, 2000); // Poll while scanning
+                    btn.textContent = 'Scanning...';
+                    setTimeout(checkScanStatus, 2000);
                 } else {
-                    if (data.last_scan) {
-                        status.textContent = `${data.cards_indexed} cards indexed`;
-                        status.style.color = '#2ecc71';
-                    }
+                    if (data.last_scan) { status.textContent = `${data.cards_indexed} cards indexed`; status.style.color = '#2ecc71'; }
                     btn.disabled = false;
-                    btn.textContent = '🔄 Rescan Index';
-                    loadStats(); // Refresh stats after scan
+                    btn.textContent = 'Rescan Index';
+                    loadStats();
                 }
-            } catch (e) {
-                console.error('Failed to check scan status:', e);
-            }
+            } catch (e) { console.error('Failed to check scan status:', e); }
         }
 
-        // Check Nextcloud status on load
-        async function checkNextcloudStatus() {
-            try {
-                const res = await fetch('/api/nextcloud/status');
-                const data = await res.json();
-                const status = document.getElementById('nextcloud-status');
-
-                if (data.running) {
-                    document.getElementById('nextcloud-btn').disabled = true;
-                    status.textContent = 'Scan in progress...';
-                    status.style.color = '#f39c12';
-                } else if (data.last_scan) {
-                    const lastScan = new Date(data.last_scan).toLocaleString();
-                    status.textContent = 'Last scan: ' + lastScan;
-                    status.style.color = '#888';
-                }
-            } catch (e) {}
-        }
-
-        // Initial load
         loadStats();
         loadDuplicates();
         loadProhibited();
         loadTags();
         searchCards();
         checkScanStatus();
-        checkNextcloudStatus();
+
+        // ===== IMPORT FUNCTIONS =====
+        let importScanResults = null;
+        let selectedForImport = new Set();
+
+        async function scanForImport() {
+            const sourceDir = document.getElementById('import-source-dir').value.trim();
+            if (!sourceDir) {
+                showToast('Please enter a source directory', true);
+                return;
+            }
+
+            const recursive = document.getElementById('import-recursive').checked;
+            const btn = document.getElementById('import-scan-btn');
+            const loading = document.getElementById('import-loading');
+            const results = document.getElementById('import-results');
+            const status = document.getElementById('import-status');
+
+            btn.disabled = true;
+            btn.textContent = 'Scanning...';
+            loading.style.display = 'block';
+            results.style.display = 'none';
+            status.style.display = 'block';
+            status.querySelector('#import-status-text').textContent = 'Scanning source directory...';
+
+            try {
+                const res = await fetch(`/api/import/scan?source_dir=${encodeURIComponent(sourceDir)}&recursive=${recursive}`, { method: 'POST' });
+                const data = await res.json();
+
+                if (!res.ok) {
+                    throw new Error(data.detail || 'Scan failed');
+                }
+
+                importScanResults = data;
+                selectedForImport.clear();
+
+                // Update counts
+                document.getElementById('import-new-count').textContent = data.summary.new_cards;
+                document.getElementById('import-dupe-count').textContent = data.summary.duplicates;
+                document.getElementById('import-prohibited-count').textContent = data.summary.prohibited;
+                document.getElementById('import-quarantine-count').textContent = data.summary.quarantine;
+
+                // Render lists
+                renderImportNewList(data.new_cards);
+                renderImportQuarantineList(data.quarantine);
+                renderImportProhibitedList(data.prohibited);
+                renderImportDuplicatesList(data.duplicates);
+
+                status.querySelector('#import-status-text').textContent = `Scan complete: ${data.total_files} files processed`;
+                status.querySelector('#import-status-text').style.color = '#2ecc71';
+                results.style.display = 'block';
+                showImportTab('new');
+
+            } catch (e) {
+                status.querySelector('#import-status-text').textContent = 'Error: ' + e.message;
+                status.querySelector('#import-status-text').style.color = '#e74c3c';
+                showToast('Scan failed: ' + e.message, true);
+            }
+
+            loading.style.display = 'none';
+            btn.disabled = false;
+            btn.textContent = 'Scan';
+        }
+
+        function showImportTab(tab) {
+            const sections = ['new', 'quarantine', 'prohibited', 'duplicates'];
+            const tabs = document.querySelectorAll('#import-results .tabs .tab');
+
+            sections.forEach((s, i) => {
+                document.getElementById(`import-${s}-section`).style.display = s === tab ? 'block' : 'none';
+                tabs[i].classList.toggle('active', s === tab);
+            });
+        }
+
+        function renderImportNewList(cards) {
+            const list = document.getElementById('import-new-list');
+            if (!cards || cards.length === 0) {
+                list.innerHTML = '<div class="empty">No new cards found</div>';
+                return;
+            }
+            list.innerHTML = cards.map(card => `
+                <div class="card" style="position:relative;" data-path="${encodeURIComponent(card.path)}">
+                    <input type="checkbox" class="import-checkbox" style="position:absolute;top:8px;left:8px;z-index:10;width:20px;height:20px;"
+                           onchange="toggleImportSelect('${encodeURIComponent(card.path)}')">
+                    ${card.nsfw ? '<span class="nsfw-badge">NSFW</span>' : ''}
+                    <div style="width:100%;aspect-ratio:1;background:#0f3460;display:flex;align-items:center;justify-content:center;color:#666;">
+                        <span style="font-size:2rem;">?</span>
+                    </div>
+                    <div class="card-info">
+                        <h4>${card.name || card.file}</h4>
+                        <p>${card.creator || 'Unknown'}</p>
+                        <p style="font-size:0.7rem;color:#667eea;">${card.folder}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderImportQuarantineList(cards) {
+            const list = document.getElementById('import-quarantine-list');
+            if (!cards || cards.length === 0) {
+                list.innerHTML = '<div class="empty">No cards in quarantine</div>';
+                return;
+            }
+            list.innerHTML = cards.map(card => `
+                <div class="dupe-group" data-path="${encodeURIComponent(card.path)}">
+                    <h4>${card.name || card.file}</h4>
+                    <p style="color:#888;margin-bottom:10px;">by ${card.creator || 'Unknown'}</p>
+                    <p style="color:#f39c12;margin-bottom:10px;"><strong>Reason:</strong> ${card.reason}</p>
+                    <div style="background:#1a1a2e;padding:10px;border-radius:6px;margin-bottom:10px;">
+                        <p style="font-size:0.85rem;color:#888;">Matched content:</p>
+                        ${card.matches.map(m => `<p style="font-family:monospace;font-size:0.8rem;color:#e74c3c;">${m}</p>`).join('')}
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-primary" onclick="reviewQuarantine('${encodeURIComponent(card.path)}', 'approve')">Approve & Import</button>
+                        <button class="btn btn-danger" onclick="reviewQuarantine('${encodeURIComponent(card.path)}', 'reject')">Reject</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderImportProhibitedList(cards) {
+            const list = document.getElementById('import-prohibited-list');
+            if (!cards || cards.length === 0) {
+                list.innerHTML = '<div class="empty">No prohibited cards found</div>';
+                return;
+            }
+            list.innerHTML = cards.map(card => `
+                <div class="dupe-group" style="border-left:4px solid #e74c3c;">
+                    <h4>${card.name || card.file}</h4>
+                    <p style="color:#888;">by ${card.creator || 'Unknown'}</p>
+                    <p style="color:#e74c3c;"><strong>Blocked:</strong> ${card.reason}</p>
+                    <div style="margin-top:8px;">
+                        ${(card.matches || []).map(m => `<span class="tag blocked">${m}</span>`).join('')}
+                    </div>
+                    <p style="font-family:monospace;font-size:0.75rem;color:#666;margin-top:8px;">${card.path}</p>
+                </div>
+            `).join('');
+        }
+
+        function renderImportDuplicatesList(cards) {
+            const list = document.getElementById('import-duplicates-list');
+            if (!cards || cards.length === 0) {
+                list.innerHTML = '<div class="empty">No duplicates found</div>';
+                return;
+            }
+            list.innerHTML = cards.map(card => `
+                <div class="dupe-group" style="border-left:4px solid #667eea;">
+                    <h4>${card.name || card.file}</h4>
+                    <p style="color:#888;">by ${card.creator || 'Unknown'}</p>
+                    <p style="color:#667eea;"><strong>Reason:</strong> ${card.reason}</p>
+                    <p style="font-family:monospace;font-size:0.75rem;color:#666;margin-top:8px;">${card.path}</p>
+                </div>
+            `).join('');
+        }
+
+        function toggleImportSelect(encodedPath) {
+            const path = decodeURIComponent(encodedPath);
+            if (selectedForImport.has(path)) {
+                selectedForImport.delete(path);
+            } else {
+                selectedForImport.add(path);
+            }
+        }
+
+        function toggleSelectAllImport() {
+            const selectAll = document.getElementById('import-select-all').checked;
+            const checkboxes = document.querySelectorAll('.import-checkbox');
+
+            checkboxes.forEach(cb => {
+                cb.checked = selectAll;
+                const card = cb.closest('.card');
+                const path = decodeURIComponent(card.dataset.path);
+                if (selectAll) {
+                    selectedForImport.add(path);
+                } else {
+                    selectedForImport.delete(path);
+                }
+            });
+        }
+
+        async function importAllNew() {
+            if (!importScanResults || !importScanResults.new_cards.length) {
+                showToast('No new cards to import', true);
+                return;
+            }
+
+            if (!confirm(`Import all ${importScanResults.new_cards.length} new cards?`)) return;
+
+            const paths = importScanResults.new_cards.map(c => c.path);
+            await executeImport(paths);
+        }
+
+        async function importSelected() {
+            if (selectedForImport.size === 0) {
+                showToast('No cards selected', true);
+                return;
+            }
+
+            if (!confirm(`Import ${selectedForImport.size} selected cards?`)) return;
+
+            await executeImport(Array.from(selectedForImport));
+        }
+
+        async function executeImport(paths) {
+            const btn = document.getElementById('import-all-btn');
+            btn.disabled = true;
+            btn.textContent = 'Importing...';
+
+            try {
+                const params = paths.map(p => `source_paths=${encodeURIComponent(p)}`).join('&');
+                const res = await fetch(`/api/import/execute?${params}`, { method: 'POST' });
+                const data = await res.json();
+
+                if (data.success) {
+                    showToast(`Imported ${data.imported_count} cards (${data.failed_count} failed)`);
+                    loadStats();
+                    // Remove imported cards from the list
+                    paths.forEach(p => {
+                        const card = document.querySelector(`.card[data-path="${encodeURIComponent(p)}"]`);
+                        if (card) card.remove();
+                    });
+                    selectedForImport.clear();
+                    document.getElementById('import-new-count').textContent =
+                        parseInt(document.getElementById('import-new-count').textContent) - data.imported_count;
+                } else {
+                    showToast('Import failed', true);
+                }
+            } catch (e) {
+                showToast('Import error: ' + e.message, true);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Import All New Cards';
+        }
+
+        async function reviewQuarantine(encodedPath, decision) {
+            const path = decodeURIComponent(encodedPath);
+
+            try {
+                const res = await fetch(`/api/import/quarantine/review?source_path=${encodeURIComponent(path)}&decision=${decision}`, { method: 'POST' });
+                const data = await res.json();
+
+                if (decision === 'approve') {
+                    showToast('Card approved and imported');
+                    loadStats();
+                } else {
+                    showToast('Card rejected');
+                }
+
+                // Remove from list
+                const group = document.querySelector(`.dupe-group[data-path="${encodedPath}"]`);
+                if (group) group.remove();
+
+                // Update count
+                const count = parseInt(document.getElementById('import-quarantine-count').textContent);
+                document.getElementById('import-quarantine-count').textContent = Math.max(0, count - 1);
+
+            } catch (e) {
+                showToast('Review error: ' + e.message, true);
+            }
+        }
+
+        async function approveAllQuarantine() {
+            if (!confirm('Approve and import ALL quarantined cards?')) return;
+
+            try {
+                const res = await fetch('/api/import/quarantine/bulk-review?decision=approve', { method: 'POST' });
+                const data = await res.json();
+                showToast(`Approved ${data.reviewed} cards, imported ${data.imported}`);
+                document.getElementById('import-quarantine-list').innerHTML = '<div class="empty">All cards reviewed</div>';
+                document.getElementById('import-quarantine-count').textContent = '0';
+                loadStats();
+            } catch (e) {
+                showToast('Bulk approve error: ' + e.message, true);
+            }
+        }
+
+        async function rejectAllQuarantine() {
+            if (!confirm('Reject ALL quarantined cards?')) return;
+
+            try {
+                const res = await fetch('/api/import/quarantine/bulk-review?decision=reject', { method: 'POST' });
+                const data = await res.json();
+                showToast(`Rejected ${data.reviewed} cards`);
+                document.getElementById('import-quarantine-list').innerHTML = '<div class="empty">All cards reviewed</div>';
+                document.getElementById('import-quarantine-count').textContent = '0';
+            } catch (e) {
+                showToast('Bulk reject error: ' + e.message, true);
+            }
+        }
     </script>
 </body>
 </html>
 """
+
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Serve the web dashboard."""
     return DASHBOARD_HTML
 
+
 @app.get("/api/info")
 async def api_info():
+    duplicates = index.get_duplicates()
     return {
         "service": "Character Card Index",
-        "version": "2.0.0",
-        "total_cards": len(index.cards),
-        "prohibited_deleted": len(index.prohibited_deleted),
-        "duplicate_groups": len(index.duplicates),
+        "version": "2.0.0-sqlite",
+        "total_cards": index.get_card_count(),
+        "prohibited_deleted": index.get_prohibited_count(),
+        "duplicate_groups": len(duplicates),
         "config": {
             "auto_delete_prohibited": AUTO_DELETE_PROHIBITED,
-            "detect_duplicates": DETECT_DUPLICATES
+            "detect_duplicates": DETECT_DUPLICATES,
+            "database": DB_FILE
         },
         "endpoints": {
             "search": "/api/cards",
@@ -1694,13 +2514,14 @@ async def api_info():
         }
     }
 
+
 @app.get("/api/cards")
 async def search_cards(
     q: Optional[str] = Query(None, description="Search query"),
     tags: Optional[str] = Query(None, description="Comma-separated tags"),
     nsfw: Optional[bool] = Query(None, description="Filter by NSFW"),
     creator: Optional[str] = Query(None, description="Filter by creator"),
-    folder: Optional[str] = Query(None, description="Filter by folder (chub/booru)"),
+    folder: Optional[str] = Query(None, description="Filter by folder"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0)
 ):
@@ -1724,14 +2545,16 @@ async def search_cards(
         "results": [asdict(c) for c in results]
     }
 
+
 @app.get("/api/cards/{folder}/{filename}")
 async def get_card(folder: str, filename: str):
     """Get full metadata for a specific card."""
-    # Find the card
-    for path, entry in index.cards.items():
-        if entry.folder == folder and entry.file == filename:
-            # Get full metadata from file
-            metadata = index.extract_metadata(path)
+    with index._cursor() as cur:
+        cur.execute("SELECT * FROM cards WHERE folder = ? AND file = ?", (folder, filename))
+        row = cur.fetchone()
+        if row:
+            entry = index._row_to_entry(row)
+            metadata = index.extract_metadata(entry.path)
             return {
                 "entry": asdict(entry),
                 "full_metadata": metadata
@@ -1739,80 +2562,65 @@ async def get_card(folder: str, filename: str):
 
     raise HTTPException(status_code=404, detail="Card not found")
 
+
 @app.get("/cards/{folder}/{filename}")
 async def serve_card_image(folder: str, filename: str):
     """Serve the actual card PNG file."""
-    for path, entry in index.cards.items():
-        if entry.folder == folder and entry.file == filename:
-            return FileResponse(path, media_type="image/png")
+    with index._cursor() as cur:
+        cur.execute("SELECT path FROM cards WHERE folder = ? AND file = ?", (folder, filename))
+        row = cur.fetchone()
+        if row:
+            return FileResponse(row[0], media_type="image/png")
 
     raise HTTPException(status_code=404, detail="Card not found")
+
 
 @app.get("/api/stats")
 async def get_stats():
     """Get index statistics."""
-    all_tags = {}
-    creators = {}
-    nsfw_count = 0
-    sfw_count = 0
-    folders = {}
-
-    for entry in index.cards.values():
-        for tag in entry.tags:
-            all_tags[tag] = all_tags.get(tag, 0) + 1
-        creators[entry.creator] = creators.get(entry.creator, 0) + 1
-        folders[entry.folder] = folders.get(entry.folder, 0) + 1
-        if entry.nsfw:
-            nsfw_count += 1
-        else:
-            sfw_count += 1
-
-    # Sort tags by count
-    top_tags = sorted(all_tags.items(), key=lambda x: x[1], reverse=True)[:100]
-    top_creators = sorted(creators.items(), key=lambda x: x[1], reverse=True)[:50]
+    stats = index.get_stats()
+    tags = index.get_all_tags()
+    duplicates = index.get_duplicates()
+    image_duplicates = index.get_image_duplicates()
 
     return {
-        "total_cards": len(index.cards),
-        "nsfw_count": nsfw_count,
-        "sfw_count": sfw_count,
-        "unique_creators": len(creators),
-        "unique_tags": len(all_tags),
-        "prohibited_deleted": len(index.prohibited_deleted),
-        "content_duplicate_groups": len([p for p in index.duplicates.values() if len(p) > 1]),
-        "image_duplicate_groups": len([p for p in index.image_duplicates.values() if len(p) > 1]),
+        "total_cards": stats["total_cards"],
+        "nsfw_count": stats["nsfw_count"],
+        "sfw_count": stats["sfw_count"],
+        "unique_creators": stats["unique_creators"],
+        "unique_tags": len(tags),
+        "prohibited_deleted": index.get_prohibited_count(),
+        "content_duplicate_groups": len([p for p in duplicates.values() if len(p) > 1]),
+        "image_duplicate_groups": len([p for p in image_duplicates.values() if len(p) > 1]),
         "image_hash_enabled": IMAGE_HASH_AVAILABLE,
-        "top_tags": top_tags,
-        "top_creators": top_creators,
-        "folders": folders
+        "top_tags": tags[:100],
+        "top_creators": stats["top_creators"],
+        "folders": stats["folders"]
     }
+
 
 @app.get("/api/tags")
 async def get_tags():
     """Get all unique tags with counts."""
-    all_tags = {}
-    for entry in index.cards.values():
-        for tag in entry.tags:
-            all_tags[tag] = all_tags.get(tag, 0) + 1
+    return {"tags": index.get_all_tags()}
 
-    sorted_tags = sorted(all_tags.items(), key=lambda x: x[1], reverse=True)
-    return {"tags": sorted_tags}
 
 @app.get("/api/prohibited")
 async def get_prohibited():
     """Get list of prohibited cards that were deleted."""
     return {
-        "total_deleted": len(index.prohibited_deleted),
+        "total_deleted": index.get_prohibited_count(),
         "auto_delete_enabled": AUTO_DELETE_PROHIBITED,
-        "deleted": index.prohibited_deleted[-100:]  # Last 100
+        "deleted": index.get_prohibited_deleted(100)
     }
+
 
 @app.get("/api/duplicates")
 async def get_duplicates():
-    """Get list of detected duplicate cards (content and image based)."""
+    """Get list of detected duplicate cards."""
 
     def get_card_info(path: str) -> dict:
-        """Get card info for display."""
-        entry = index.cards.get(path)
+        entry = index.get_card_by_path(path)
         if entry:
             return {
                 "path": path,
@@ -1824,20 +2632,10 @@ async def get_duplicates():
             }
         return {"path": path, "name": Path(path).stem, "creator": "Unknown", "folder": "", "file": Path(path).name, "nsfw": False}
 
-    def is_ignored(paths: List[str]) -> bool:
-        """Check if this duplicate group has been marked as not-a-duplicate.
-        Only hides if EXACT same paths - any new file will show the group again."""
-        path_set = frozenset(paths)
-        # Only exact match - if new files added, show again
-        return path_set in index.ignored_duplicates
-
     # Content-based duplicates
     content_dupes = []
-    for content_hash, paths in index.duplicates.items():
-        if len(paths) > 1:
-            # Skip if marked as non-duplicate
-            if is_ignored(paths):
-                continue
+    for content_hash, paths in index.get_duplicates().items():
+        if len(paths) > 1 and not index.is_duplicate_ignored(paths):
             content_dupes.append({
                 "type": "content",
                 "hash": content_hash,
@@ -1847,43 +2645,25 @@ async def get_duplicates():
 
     # Image-based duplicates
     image_dupes = []
-    for image_hash, paths in index.image_duplicates.items():
+    for image_hash, paths in index.get_image_duplicates().items():
         if len(paths) > 1:
-            # Filter paths to only include cards with similar names
             cards_info = [(p, get_card_info(p)) for p in paths if os.path.exists(p)]
-            if len(cards_info) < 2:
-                continue
+            if len(cards_info) >= 2 and not index.is_duplicate_ignored([p for p, _ in cards_info]):
+                # Verify name similarity
+                filtered_cards = [cards_info[0]]
+                base_name = cards_info[0][1]["name"]
+                for p, info in cards_info[1:]:
+                    if name_similarity(base_name, info["name"]) > 0.3:
+                        filtered_cards.append((p, info))
 
-            # Verify name similarity - group by similar names
-            filtered_cards = [cards_info[0]]
-            base_name = cards_info[0][1]["name"]
-            for p, info in cards_info[1:]:
-                if name_similarity(base_name, info["name"]) > 0.3:
-                    filtered_cards.append((p, info))
+                if len(filtered_cards) >= 2:
+                    image_dupes.append({
+                        "type": "image",
+                        "hash": image_hash,
+                        "count": len(filtered_cards),
+                        "cards": [info for _, info in filtered_cards]
+                    })
 
-            if len(filtered_cards) < 2:
-                continue
-
-            # Skip if already caught by content hash
-            content_hashes_in_group = set()
-            for p, _ in filtered_cards:
-                entry = index.cards.get(p)
-                if entry and entry.content_hash:
-                    content_hashes_in_group.add(entry.content_hash)
-            # Only add if not all same content hash (would be redundant)
-            if len(content_hashes_in_group) > 1 or len(content_hashes_in_group) == 0:
-                # Skip if marked as non-duplicate
-                filtered_paths = [p for p, _ in filtered_cards]
-                if is_ignored(filtered_paths):
-                    continue
-                image_dupes.append({
-                    "type": "image",
-                    "hash": image_hash,
-                    "count": len(filtered_cards),
-                    "cards": [info for _, info in filtered_cards]
-                })
-
-    # Combine and sort by count
     all_dupes = content_dupes + image_dupes
     all_dupes.sort(key=lambda x: x["count"], reverse=True)
 
@@ -1894,29 +2674,30 @@ async def get_duplicates():
         "total_duplicate_files": sum(d["count"] - 1 for d in all_dupes),
         "detect_enabled": DETECT_DUPLICATES,
         "image_hash_enabled": IMAGE_HASH_AVAILABLE,
-        "duplicates": all_dupes[:100]  # Top 100 groups
+        "duplicates": all_dupes[:100]
     }
+
 
 @app.get("/api/cards/similar")
 async def find_similar_cards(
-    path: str = Query(None, description="Path to card to find similar to"),
+    path: str = Query(None, description="Path to card"),
     folder: str = Query(None, description="Folder of card"),
     file: str = Query(None, description="Filename of card"),
-    threshold: int = Query(18, description="Image hash distance threshold (higher = more matches)")
+    threshold: int = Query(18, description="Image hash threshold")
 ):
-    """Find cards similar to a given card (by image and/or name)."""
-    # Find the source card
+    """Find cards similar to a given card."""
     source_entry = None
     source_path = path
 
-    if path and path in index.cards:
-        source_entry = index.cards[path]
+    if path:
+        source_entry = index.get_card_by_path(path)
     elif folder and file:
-        for p, entry in index.cards.items():
-            if entry.folder == folder and entry.file == file:
-                source_entry = entry
-                source_path = p
-                break
+        with index._cursor() as cur:
+            cur.execute("SELECT * FROM cards WHERE folder = ? AND file = ?", (folder, file))
+            row = cur.fetchone()
+            if row:
+                source_entry = index._row_to_entry(row)
+                source_path = source_entry.path
 
     if not source_entry:
         raise HTTPException(status_code=404, detail="Source card not found")
@@ -1924,20 +2705,21 @@ async def find_similar_cards(
     similar = []
     source_hash = index.image_hash_objects.get(source_path)
 
-    for card_path, entry in index.cards.items():
+    # Get all cards for comparison
+    all_cards = index.get_all_cards()
+
+    for card_path, entry in all_cards.items():
         if card_path == source_path:
             continue
 
         similarity_score = 0
         match_reasons = []
 
-        # Check name similarity
         name_sim = name_similarity(source_entry.name, entry.name)
         if name_sim > 0.3:
             similarity_score += name_sim * 50
             match_reasons.append(f"name ({int(name_sim*100)}%)")
 
-        # Check image similarity
         if source_hash and IMAGE_HASH_AVAILABLE:
             card_hash = index.image_hash_objects.get(card_path)
             if card_hash:
@@ -1947,7 +2729,6 @@ async def find_similar_cards(
                     similarity_score += img_score
                     match_reasons.append(f"image (dist={distance})")
 
-        # Check creator match
         if source_entry.creator.lower() == entry.creator.lower() and source_entry.creator.lower() != "unknown":
             similarity_score += 10
             match_reasons.append("same creator")
@@ -1964,7 +2745,6 @@ async def find_similar_cards(
                 "reasons": match_reasons
             })
 
-    # Sort by score descending
     similar.sort(key=lambda x: x["score"], reverse=True)
 
     return {
@@ -1975,7 +2755,7 @@ async def find_similar_cards(
             "file": source_entry.file
         },
         "similar_count": len(similar),
-        "similar": similar[:50]  # Top 50
+        "similar": similar[:50]
     }
 
 
@@ -1988,29 +2768,22 @@ async def upload_card(
     if not file.filename.lower().endswith('.png'):
         raise HTTPException(status_code=400, detail="Only PNG files are supported")
 
-    # Use first configured directory as upload destination
     if not CARD_DIRS or not CARD_DIRS[0]:
         raise HTTPException(status_code=500, detail="No card directories configured")
 
     base_dir = CARD_DIRS[0]
-
-    # Sanitize folder name
     safe_folder = "".join(c for c in folder if c.isalnum() or c in " -_").strip() or "Uploads"
     upload_dir = os.path.join(base_dir, safe_folder)
 
     try:
         os.makedirs(upload_dir, exist_ok=True)
-
-        # Sanitize filename
         safe_filename = "".join(c for c in file.filename if c.isalnum() or c in " -_.").strip()
         if not safe_filename.lower().endswith('.png'):
             safe_filename += '.png'
 
         filepath = os.path.join(upload_dir, safe_filename)
 
-        # Check if file already exists
         if os.path.exists(filepath):
-            # Add number suffix
             base, ext = os.path.splitext(safe_filename)
             counter = 1
             while os.path.exists(filepath):
@@ -2018,18 +2791,13 @@ async def upload_card(
                 filepath = os.path.join(upload_dir, safe_filename)
                 counter += 1
 
-        # Save the file
         with open(filepath, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         logger.info(f"Uploaded card: {filepath}")
 
-        # Index immediately (file watcher will also pick it up, but this is faster)
         entry = index.index_card(filepath, delete_prohibited=True)
         if entry:
-            index.cards[filepath] = entry
-            # Save index
-            index.save_index()
             return {
                 "success": True,
                 "path": filepath,
@@ -2039,21 +2807,11 @@ async def upload_card(
                 "indexed": True
             }
         else:
-            # File was deleted (prohibited) or has no valid metadata
-            # Check if file still exists to determine reason
             if os.path.exists(filepath):
-                # File exists but no metadata - delete it
                 os.remove(filepath)
-                return {
-                    "success": False,
-                    "detail": "Invalid character card: no embedded metadata found"
-                }
+                return {"success": False, "detail": "Invalid character card: no embedded metadata found"}
             else:
-                # File was deleted due to prohibited content
-                return {
-                    "success": False,
-                    "detail": "Card rejected: prohibited content detected"
-                }
+                return {"success": False, "detail": "Card rejected: prohibited content detected"}
 
     except Exception as e:
         logger.error(f"Upload failed: {e}")
@@ -2066,74 +2824,27 @@ async def delete_card(path: str = Query(..., description="Full path to the card 
     if not path:
         raise HTTPException(status_code=400, detail="Path required")
 
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-            # Remove from index
-            if path in index.cards:
-                del index.cards[path]
-            # Remove from duplicate tracking
-            for hash_key, paths in list(index.duplicates.items()):
-                if path in paths:
-                    paths.remove(path)
-            for hash_key, paths in list(index.image_duplicates.items()):
-                if path in paths:
-                    paths.remove(path)
-            if path in index.image_hash_objects:
-                del index.image_hash_objects[path]
-
-            logger.info(f"Deleted card: {path}")
-            return {"success": True, "deleted": path}
-        else:
-            raise HTTPException(status_code=404, detail="File not found")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to delete {path}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    if index.delete_card(path):
+        return {"success": True, "deleted": path}
+    else:
+        raise HTTPException(status_code=404, detail="File not found or delete failed")
 
 
 @app.post("/api/duplicates/ignore")
-async def ignore_duplicate_group(paths: List[str] = Query(..., description="Paths in the duplicate group to ignore")):
-    """Mark a group of cards as NOT duplicates (persists between scans)."""
+async def ignore_duplicate_group(paths: List[str] = Query(..., description="Paths in the duplicate group")):
+    """Mark a group of cards as NOT duplicates."""
     if len(paths) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 paths")
 
-    # Add to ignored set
-    ignored_set = frozenset(paths)
-    index.ignored_duplicates.add(ignored_set)
-
-    # Save index to persist
-    index.save_index()
-
+    index.ignore_duplicate(paths)
     logger.info(f"Marked as non-duplicate: {paths}")
     return {"status": "Marked as non-duplicate", "paths": paths}
-
-
-@app.delete("/api/duplicates/unignore")
-async def unignore_duplicate_group(paths: List[str] = Query(..., description="Paths to remove from ignore list")):
-    """Remove a group from the ignored duplicates list."""
-    ignored_set = frozenset(paths)
-    if ignored_set in index.ignored_duplicates:
-        index.ignored_duplicates.remove(ignored_set)
-        index.save_index()
-        return {"status": "Removed from ignore list", "paths": paths}
-    return {"status": "Not found in ignore list", "paths": paths}
-
-
-@app.get("/api/duplicates/ignored")
-async def get_ignored_duplicates():
-    """Get list of ignored duplicate groups."""
-    return {
-        "count": len(index.ignored_duplicates),
-        "ignored": [list(s) for s in index.ignored_duplicates]
-    }
 
 
 @app.delete("/api/duplicates/clean")
 async def clean_duplicates(
     keep: str = Query("first", description="Which to keep: 'first' or 'largest'"),
-    type: str = Query("all", description="Which duplicates to clean: 'content', 'image', or 'all'")
+    type: str = Query("all", description="Which duplicates: 'content', 'image', or 'all'")
 ):
     """Delete duplicate files, keeping one copy of each."""
     if not DETECT_DUPLICATES:
@@ -2145,60 +2856,41 @@ async def clean_duplicates(
     def clean_group(paths: List[str]):
         if len(paths) <= 1:
             return
-
-        # Filter out already deleted
         valid_paths = [p for p in paths if p not in already_deleted and os.path.exists(p)]
         if len(valid_paths) <= 1:
             return
 
-        # Decide which to keep
         if keep == "largest":
             paths_with_size = [(p, os.path.getsize(p)) for p in valid_paths]
             paths_with_size.sort(key=lambda x: x[1], reverse=True)
-            keep_path = paths_with_size[0][0]
             delete_paths = [p for p, _ in paths_with_size[1:]]
         else:
-            keep_path = valid_paths[0]
             delete_paths = valid_paths[1:]
 
         for path in delete_paths:
-            try:
-                if os.path.exists(path) and path not in already_deleted:
-                    os.remove(path)
-                    deleted.append(path)
-                    already_deleted.add(path)
-                    if path in index.cards:
-                        del index.cards[path]
-                    logger.info(f"Deleted duplicate: {path}")
-            except Exception as e:
-                logger.error(f"Failed to delete duplicate {path}: {e}")
+            if index.delete_card(path):
+                deleted.append(path)
+                already_deleted.add(path)
+                logger.info(f"Deleted duplicate: {path}")
 
-    # Clean content duplicates
     if type in ["all", "content"]:
-        for paths in index.duplicates.values():
+        for paths in index.get_duplicates().values():
             clean_group(paths)
-        index.duplicates.clear()
-        index.content_hashes.clear()
 
-    # Clean image duplicates
     if type in ["all", "image"]:
-        for paths in index.image_duplicates.values():
+        for paths in index.get_image_duplicates().values():
             clean_group(paths)
-        index.image_duplicates.clear()
-        index.image_hashes.clear()
 
-    return {
-        "deleted_count": len(deleted),
-        "deleted_files": deleted[:100]
-    }
+    return {"deleted_count": len(deleted), "deleted_files": deleted[:100]}
 
 
 # Nextcloud scan tracking
 nextcloud_scan_status = {"running": False, "last_scan": None, "last_result": None}
 
+
 @app.post("/api/nextcloud/scan")
-async def trigger_nextcloud_scan(user: str = Query(None, description="Nextcloud user to scan (default: from config)")):
-    """Trigger a Nextcloud file scan (snap-based)."""
+async def trigger_nextcloud_scan(user: str = Query(None, description="Nextcloud user to scan")):
+    """Trigger a Nextcloud file scan."""
     global nextcloud_scan_status
 
     if nextcloud_scan_status["running"]:
@@ -2208,39 +2900,31 @@ async def trigger_nextcloud_scan(user: str = Query(None, description="Nextcloud 
     nextcloud_scan_status["running"] = True
 
     try:
-        # Run nextcloud.occ files:scan for snap-based install
         logger.info(f"Starting Nextcloud scan for user: {scan_user}")
         result = subprocess.run(
             ["sudo", "nextcloud.occ", "files:scan", scan_user],
-            capture_output=True,
-            text=True,
-            timeout=3600  # 1 hour timeout
+            capture_output=True, text=True, timeout=3600
         )
 
         nextcloud_scan_status["last_scan"] = datetime.utcnow().isoformat()
         nextcloud_scan_status["last_result"] = {
             "success": result.returncode == 0,
             "return_code": result.returncode,
-            "stdout": result.stdout[-2000:] if result.stdout else "",  # Last 2000 chars
+            "stdout": result.stdout[-2000:] if result.stdout else "",
             "stderr": result.stderr[-1000:] if result.stderr else ""
         }
-
-        if result.returncode == 0:
-            logger.info(f"Nextcloud scan completed successfully")
-        else:
-            logger.error(f"Nextcloud scan failed: {result.stderr}")
 
         return nextcloud_scan_status["last_result"]
 
     except subprocess.TimeoutExpired:
-        nextcloud_scan_status["last_result"] = {"success": False, "error": "Scan timed out after 1 hour"}
+        nextcloud_scan_status["last_result"] = {"success": False, "error": "Scan timed out"}
         raise HTTPException(status_code=504, detail="Scan timed out")
     except Exception as e:
         nextcloud_scan_status["last_result"] = {"success": False, "error": str(e)}
-        logger.error(f"Nextcloud scan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         nextcloud_scan_status["running"] = False
+
 
 @app.get("/api/nextcloud/status")
 async def get_nextcloud_status():
@@ -2252,11 +2936,12 @@ async def get_nextcloud_status():
 async def get_index_status():
     """Get index scan status."""
     return {
-        "cards_indexed": len(index.cards),
+        "cards_indexed": index.get_card_count(),
         "scan_running": index.scan_status["running"],
         "scan_progress": index.scan_status["progress"],
         "scan_total": index.scan_status["total"],
-        "last_scan": index.scan_status["last_scan"]
+        "last_scan": index.scan_status["last_scan"],
+        "watcher": watcher_status
     }
 
 
@@ -2272,10 +2957,164 @@ async def trigger_rescan():
 
 @app.post("/api/index/save")
 async def save_index_now():
-    """Manually save the index to disk."""
-    if index.save_index():
-        return {"status": "Index saved", "cards": len(index.cards)}
-    raise HTTPException(status_code=500, detail="Failed to save index")
+    """Manually save the index (no-op for SQLite, auto-persists)."""
+    return {"status": "Index auto-saved (SQLite)", "cards": index.get_card_count()}
+
+
+# ===== IMPORT ENDPOINTS =====
+
+import_status = {"running": False, "progress": 0, "total": 0, "source_dir": None}
+
+
+@app.post("/api/import/scan")
+async def scan_for_import(
+    source_dir: str = Query(..., description="Source directory to scan"),
+    recursive: bool = Query(True, description="Scan subdirectories")
+):
+    """
+    Scan a source directory for cards to import.
+    Returns categorized results: new, duplicates, prohibited, quarantine.
+    Does NOT modify any files.
+    """
+    global import_status
+
+    if import_status["running"]:
+        raise HTTPException(status_code=409, detail="Import scan already in progress")
+
+    if not os.path.exists(source_dir):
+        raise HTTPException(status_code=404, detail=f"Directory not found: {source_dir}")
+
+    import_status["running"] = True
+    import_status["source_dir"] = source_dir
+
+    try:
+        results = index.scan_source_for_import(source_dir, recursive=recursive)
+        return {
+            "success": True,
+            "source_dir": source_dir,
+            "total_files": results["total_files"],
+            "summary": {
+                "new_cards": len(results["new_cards"]),
+                "duplicates": len(results["duplicates"]),
+                "prohibited": len(results["prohibited"]),
+                "quarantine": len(results["quarantine"]),
+                "errors": len(results["errors"])
+            },
+            "new_cards": results["new_cards"][:100],  # Limit response size
+            "duplicates": results["duplicates"][:50],
+            "prohibited": results["prohibited"][:50],
+            "quarantine": results["quarantine"][:50],
+            "errors": results["errors"][:20]
+        }
+    finally:
+        import_status["running"] = False
+
+
+@app.get("/api/import/status")
+async def get_import_status():
+    """Get current import scan status."""
+    return import_status
+
+
+@app.get("/api/import/last-scan")
+async def get_last_import_scan(source_dir: str = Query(None, description="Filter by source directory")):
+    """Get results from the last import scan."""
+    results = index.get_last_import_scan(source_dir)
+    if results:
+        return results
+    raise HTTPException(status_code=404, detail="No previous scan found")
+
+
+@app.post("/api/import/execute")
+async def execute_import(
+    source_paths: List[str] = Query(..., description="List of source file paths to import"),
+    destination_folder: str = Query(None, description="Destination folder name (optional)")
+):
+    """
+    Execute import of specified cards.
+    Copies files from source to destination and indexes them.
+    Does NOT delete source files.
+    """
+    if not source_paths:
+        raise HTTPException(status_code=400, detail="No source paths provided")
+
+    results = index.execute_import(source_paths, destination_folder)
+
+    return {
+        "success": True,
+        "imported_count": len(results["imported"]),
+        "failed_count": len(results["failed"]),
+        "skipped_count": len(results["skipped"]),
+        "imported": results["imported"],
+        "failed": results["failed"],
+        "skipped": results["skipped"]
+    }
+
+
+@app.get("/api/import/quarantine")
+async def get_quarantine(
+    status: str = Query(None, description="Filter by status: pending, reviewed"),
+    limit: int = Query(100, ge=1, le=500)
+):
+    """Get cards in quarantine awaiting review."""
+    cards = index.get_quarantine_list(status=status, limit=limit)
+    return {
+        "count": len(cards),
+        "cards": cards
+    }
+
+
+@app.post("/api/import/quarantine/review")
+async def review_quarantine(
+    source_path: str = Query(..., description="Source path of quarantined card"),
+    decision: str = Query(..., description="Decision: approve or reject")
+):
+    """Review a quarantined card - approve or reject for import."""
+    if decision not in ["approve", "reject"]:
+        raise HTTPException(status_code=400, detail="Decision must be 'approve' or 'reject'")
+
+    success = index.review_quarantine_card(source_path, decision)
+    if not success:
+        raise HTTPException(status_code=404, detail="Card not found in quarantine")
+
+    # If approved, import the card
+    if decision == "approve":
+        results = index.execute_import([source_path])
+        return {
+            "status": "approved and imported",
+            "import_result": results
+        }
+
+    return {"status": "rejected", "source_path": source_path}
+
+
+@app.post("/api/import/quarantine/bulk-review")
+async def bulk_review_quarantine(
+    decision: str = Query(..., description="Decision: approve or reject"),
+    source_paths: List[str] = Query(None, description="Specific paths (if not provided, applies to all pending)")
+):
+    """Bulk review quarantined cards."""
+    if decision not in ["approve", "reject"]:
+        raise HTTPException(status_code=400, detail="Decision must be 'approve' or 'reject'")
+
+    # Get cards to review
+    if source_paths:
+        paths_to_review = source_paths
+    else:
+        pending = index.get_quarantine_list(status="pending", limit=500)
+        paths_to_review = [card["source_path"] for card in pending]
+
+    results = {"reviewed": 0, "imported": 0, "failed": 0}
+
+    for path in paths_to_review:
+        if index.review_quarantine_card(path, decision):
+            results["reviewed"] += 1
+            if decision == "approve":
+                import_result = index.execute_import([path])
+                results["imported"] += len(import_result["imported"])
+                results["failed"] += len(import_result["failed"])
+
+    return results
 
 
 if __name__ == "__main__":
