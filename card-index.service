@@ -1,0 +1,15 @@
+[Unit]
+Description=Character Card Index Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/card-index-server
+ExecStart=/opt/card-index-server/venv/bin/python server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/card-index-server/.env
+
+[Install]
+WantedBy=multi-user.target

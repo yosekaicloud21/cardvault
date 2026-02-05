@@ -1,0 +1,14 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Index files
+*.json
+index.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
