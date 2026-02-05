@@ -19,8 +19,8 @@ A FastAPI server that indexes character card PNGs, detects duplicates, filters p
 ### 1. Clone and setup
 
 ```bash
-git clone https://github.com/your-username/card-index-server.git
-cd card-index-server
+git clone https://github.com/Starkka15/cardvault.git
+cd cardvault
 
 # Create virtual environment
 python3 -m venv venv
