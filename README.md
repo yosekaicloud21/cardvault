@@ -128,6 +128,7 @@ sudo systemctl start card-index
 | `CARD_DB_FILE` | `/var/lib/card-index/cards.db` | SQLite database file |
 | `CARD_WATCH_FILES` | `true` | Enable file watching for auto-detection |
 | `CARD_RESCAN_STARTUP` | `false` | Rescan all files on startup |
+| `LOREBOOK_DIRS` | (optional) | Colon-separated list of lorebook directories |
 | `NEXTCLOUD_USER` | (optional) | Nextcloud user for file scan integration |
 
 ## Web Dashboard
@@ -136,6 +137,7 @@ Access the dashboard at `http://your-server:8787/`
 
 Features:
 - **Search** - Full-text search with tag filtering
+- **Lorebooks** - Browse and search lorebook collection
 - **Duplicates** - View and manage duplicate cards
 - **Prohibited Log** - View deleted prohibited content
 - **Statistics** - Total cards, NSFW count, top tags/creators
