@@ -131,6 +131,71 @@ sudo systemctl start card-index
 | `LOREBOOK_DIRS` | (optional) | Colon-separated list of lorebook directories |
 | `NEXTCLOUD_USER` | (optional) | Nextcloud user for file scan integration |
 
+## Prohibited Content Filtering
+
+**Warning: By default, CardVault uses strict content filtering that automatically deletes cards matching prohibited patterns. This may result in false positives.**
+
+### How It Works
+
+When a card is indexed, CardVault checks:
+1. **Tags** - Exact matches against a blocklist
+2. **Description & First Message** - Pattern matching for prohibited content
+3. **Age References** - Context-aware detection of minor age mentions
+
+Cards that match prohibited patterns are:
+- Logged to the prohibited deletions table (viewable at `/api/prohibited`)
+- **Automatically deleted from disk**
+
+### Disabling Auto-Delete
+
+To prevent automatic deletion, set in your `.env` file:
+
+```bash
+CARD_AUTO_DELETE=false
+```
+
+With this setting, prohibited cards will still be logged but **not deleted**.
+
+### Customizing the Blocklists
+
+The blocklists are defined at the top of `server.py` (around lines 72-117):
+
+```python
+# Exact tag matches (case-insensitive)
+BLOCKED_TAGS_EXACT = {
+    "child", "children", "underage", "minor", "minors",
+    "kid", "kids", "toddler", "infant", "preteen", ...
+}
+
+# Regex patterns for tags
+BLOCKED_PATTERNS = [re.compile(r'\bloli'), re.compile(r'\bshota'), ...]
+
+# Strict description patterns (always block)
+BLOCKED_DESCRIPTION_PATTERNS_STRICT = [
+    re.compile(r'\b(underage|under-age|under age)\b', re.IGNORECASE),
+    ...
+]
+
+# Context-sensitive age patterns (may trigger quarantine)
+AGE_PATTERNS_CONTEXT = [
+    re.compile(r'\bage\s*[:\-]?\s*([1-9]|1[0-7])\b', re.IGNORECASE),
+    ...
+]
+```
+
+To customize:
+1. Edit `server.py` directly
+2. Modify the sets/lists as needed
+3. Restart the server
+
+### Viewing Deleted Cards
+
+Check which cards were flagged and deleted:
+- **Web UI**: Click "Prohibited" tab in the dashboard
+- **API**: `GET /api/prohibited`
+
+This shows the filepath and matched patterns for each deleted card.
+
 ## Web Dashboard
 
 Access the dashboard at `http://your-server:8787/`
