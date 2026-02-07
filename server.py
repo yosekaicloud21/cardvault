@@ -7,9 +7,9 @@ Auto-deletes prohibited content and detects duplicates.
 Uses SQLite + FTS5 for fast full-text search at scale (200k+ cards).
 
 Configuration via environment variables:
-  CARD_DIRS           - List of directories to index (use ; on Windows, : on Unix)
-                        Example Windows: C:/Cards/folder1;D:/Cards/folder2
-                        Example Unix: /data/cards:/mnt/more-cards
+  CARD_DIRS           - Colon-separated list of directories to index
+                        Windows drive letters (C:, D:) are detected automatically
+                        Example: C:/Cards/folder1:D:/Cards/folder2
   CARD_HOST           - Host to bind to (default: 0.0.0.0)
   CARD_PORT           - Port to bind to (default: 8787)
   CARD_AUTO_DELETE    - Auto-delete prohibited content (default: true)

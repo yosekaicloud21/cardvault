@@ -133,17 +133,14 @@ sudo systemctl start card-index
 
 ### Path Separator for Multiple Directories
 
-When specifying multiple directories in `CARD_DIRS` or `LOREBOOK_DIRS`:
+Use colon (`:`) to separate multiple directories - works on all platforms:
 
-- **Windows**: Use semicolon (`;`) as separator
-  ```
-  CARD_DIRS=C:/Characters/folder1;D:/Characters/folder2
-  ```
+```
+CARD_DIRS=C:/Characters/folder1:D:/Characters/folder2
+CARD_DIRS=/data/cards:/mnt/more-cards
+```
 
-- **Linux/macOS**: Use colon (`:`) as separator
-  ```
-  CARD_DIRS=/data/cards:/mnt/more-cards
-  ```
+Windows drive letters (like `C:`) are automatically detected and handled correctly.
 
 ## Prohibited Content Filtering
 
