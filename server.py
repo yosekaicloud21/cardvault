@@ -108,6 +108,13 @@ WATCH_FILES = os.environ.get("CARD_WATCH_FILES", "true").lower() == "true"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Log parsed directories at startup for debugging
+logger.info(f"CARD_DIRS raw env: {os.environ.get('CARD_DIRS', '(not set)')}")
+logger.info(f"CARD_DIRS parsed: {CARD_DIRS}")
+for i, d in enumerate(CARD_DIRS):
+    exists = os.path.exists(d)
+    logger.info(f"  [{i+1}] {d} - {'EXISTS' if exists else 'NOT FOUND'}")
+
 # Prohibited content detection (blocked regardless of NSFW status)
 BLOCKED_TAGS_EXACT = {
     "child", "children", "underage", "minor", "minors",
