@@ -7,7 +7,9 @@ Auto-deletes prohibited content and detects duplicates.
 Uses SQLite + FTS5 for fast full-text search at scale (200k+ cards).
 
 Configuration via environment variables:
-  CARD_DIRS           - Colon-separated list of directories to index
+  CARD_DIRS           - List of directories to index (use ; on Windows, : on Unix)
+                        Example Windows: C:/Cards/folder1;D:/Cards/folder2
+                        Example Unix: /data/cards:/mnt/more-cards
   CARD_HOST           - Host to bind to (default: 0.0.0.0)
   CARD_PORT           - Port to bind to (default: 8787)
   CARD_AUTO_DELETE    - Auto-delete prohibited content (default: true)
@@ -51,10 +53,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 import uvicorn
 import shutil
+import platform
+
+def parse_path_list(path_string: str, default: str = "") -> list:
+    """
+    Parse a list of paths from environment variable.
+    Handles both Unix (:) and Windows (;) separators.
+    Windows paths like C:/path are handled correctly.
+    """
+    if not path_string:
+        return [default] if default else []
+
+    # If semicolon is present, use it as separator (Windows-style)
+    if ";" in path_string:
+        return [p.strip() for p in path_string.split(";") if p.strip()]
+
+    # On Windows or if path contains drive letters, be careful with colons
+    if platform.system() == "Windows" or (len(path_string) > 1 and path_string[1] == ":"):
+        # Split on colon but rejoin drive letters (e.g., C:)
+        # Pattern: split, then rejoin single letters with following path
+        parts = path_string.split(":")
+        paths = []
+        i = 0
+        while i < len(parts):
+            part = parts[i].strip()
+            # Check if this is a drive letter (single char, next part starts with / or \)
+            if len(part) == 1 and part.isalpha() and i + 1 < len(parts):
+                # Rejoin with next part
+                paths.append(f"{part}:{parts[i + 1].strip()}")
+                i += 2
+            elif part:
+                paths.append(part)
+                i += 1
+            else:
+                i += 1
+        return paths
+
+    # Unix-style: simple colon split
+    return [p.strip() for p in path_string.split(":") if p.strip()]
 
 # Configuration from environment
-CARD_DIRS = os.environ.get("CARD_DIRS", "/data/CharacterCards").split(":")
-LOREBOOK_DIRS = os.environ.get("LOREBOOK_DIRS", "").split(":") if os.environ.get("LOREBOOK_DIRS") else []
+CARD_DIRS = parse_path_list(os.environ.get("CARD_DIRS", ""), "/data/CharacterCards")
+LOREBOOK_DIRS = parse_path_list(os.environ.get("LOREBOOK_DIRS", ""))
 HOST = os.environ.get("CARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CARD_PORT", "8787"))
 RECURSIVE = os.environ.get("CARD_RECURSIVE", "true").lower() == "true"

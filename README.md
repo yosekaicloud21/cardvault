@@ -120,7 +120,7 @@ sudo systemctl start card-index
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CARD_DIRS` | (required) | Colon-separated list of directories to index |
+| `CARD_DIRS` | (required) | List of directories to index (see note below) |
 | `CARD_HOST` | `0.0.0.0` | Host to bind to |
 | `CARD_PORT` | `8787` | Port to bind to |
 | `CARD_AUTO_DELETE` | `true` | Auto-delete prohibited content |
@@ -128,8 +128,22 @@ sudo systemctl start card-index
 | `CARD_DB_FILE` | `/var/lib/card-index/cards.db` | SQLite database file |
 | `CARD_WATCH_FILES` | `true` | Enable file watching for auto-detection |
 | `CARD_RESCAN_STARTUP` | `false` | Rescan all files on startup |
-| `LOREBOOK_DIRS` | (optional) | Colon-separated list of lorebook directories |
+| `LOREBOOK_DIRS` | (optional) | List of lorebook directories (same format as CARD_DIRS) |
 | `NEXTCLOUD_USER` | (optional) | Nextcloud user for file scan integration |
+
+### Path Separator for Multiple Directories
+
+When specifying multiple directories in `CARD_DIRS` or `LOREBOOK_DIRS`:
+
+- **Windows**: Use semicolon (`;`) as separator
+  ```
+  CARD_DIRS=C:/Characters/folder1;D:/Characters/folder2
+  ```
+
+- **Linux/macOS**: Use colon (`:`) as separator
+  ```
+  CARD_DIRS=/data/cards:/mnt/more-cards
+  ```
 
 ## Prohibited Content Filtering
 
