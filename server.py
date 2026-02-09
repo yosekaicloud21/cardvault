@@ -374,6 +374,9 @@ def check_quarantine_content(tags: List[str], description: str = "", first_mes: 
     matches = set()
     full_text = f"{description} {first_mes}".lower()
     
+    # Pre-compute lowercase blocked tags for case-insensitive matching
+    blocked_tags_lower = {tag.lower() for tag in BLOCKED_TAGS_EXACT}
+    
     # Check 1: Look for blocked tag words in description text
     for blocked_word in BLOCKED_TAGS_EXACT:
         # Use word boundaries to avoid false positives
@@ -384,7 +387,7 @@ def check_quarantine_content(tags: List[str], description: str = "", first_mes: 
     # Check 2: Look for blocked tag words in actual tags
     tags_lower = [t.lower() for t in tags]
     for tag in tags_lower:
-        if tag in BLOCKED_TAGS_EXACT:
+        if tag in blocked_tags_lower:
             matches.add(f"Tag: '{tag}'")
         else:
             for pattern in BLOCKED_PATTERNS:
@@ -2732,6 +2735,13 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
+        // Helper function to escape HTML entities
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -3310,14 +3320,14 @@ DASHBOARD_HTML = """
                                 </a>
                             </div>
                             <div style="font-size:12px;color:#555;margin-bottom:8px;word-break:break-all;">
-                                <strong>${filename}</strong>
+                                <strong>${escapeHtml(filename)}</strong>
                                 <span style="background:${statusColor};color:white;padding:2px 6px;border-radius:3px;font-size:10px;margin-left:4px;">${statusLabel}</span>
                             </div>
                             <div style="font-size:11px;color:#888;margin-bottom:6px;">
-                                <strong>Reason:</strong> ${card.reason || 'N/A'}
+                                <strong>Reason:</strong> ${escapeHtml(card.reason || 'N/A')}
                             </div>
                             <div style="font-size:11px;color:#888;margin-bottom:8px;max-height:60px;overflow-y:auto;">
-                                <strong>Matches:</strong><br>${card.matches.join('<br>')}
+                                <strong>Matches:</strong><br>${card.matches.map(m => escapeHtml(m)).join('<br>')}
                             </div>
                             <div style="font-size:10px;color:#aaa;margin-bottom:10px;">
                                 Flagged: ${new Date(card.quarantined_at).toLocaleString()}
@@ -3359,8 +3369,10 @@ DASHBOARD_HTML = """
                 const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
                 if (res.ok) {
                     showToast('Card deleted');
-                    // Also remove from quarantine table
-                    await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' }).catch(() => {});
+                    // Also remove from quarantine table - failures are acceptable as card might not be in quarantine
+                    await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' }).catch(err => {
+                        console.log('Note: Card was not in quarantine table', err);
+                    });
                     loadQuarantine();
                     loadStats();
                 } else {
@@ -3372,9 +3384,9 @@ DASHBOARD_HTML = """
         }
 
         async function deleteAllQuarantine() {
-            const res = await fetch('/api/quarantine');
-            const data = await res.json();
-            const count = data.cards.length;
+            const checkRes = await fetch('/api/quarantine');
+            const checkData = await checkRes.json();
+            const count = checkData.cards.length;
             
             if (count === 0) {
                 showToast('No cards in quarantine');
@@ -4457,11 +4469,17 @@ async def approve_quarantine(path: str = Query(..., description="Path to approve
     """Remove a card from quarantine (approve it)."""
     try:
         with index._cursor() as cur:
-            cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
-            if cur.rowcount > 0:
-                return {"success": True, "message": "Card approved"}
-            else:
+            # Check if entry exists before deletion for better error handling
+            cur.execute("SELECT COUNT(*) FROM quarantine WHERE path = ?", (path,))
+            exists = cur.fetchone()[0] > 0
+            
+            if not exists:
                 raise HTTPException(status_code=404, detail="Card not found in quarantine")
+            
+            cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+            return {"success": True, "message": "Card approved"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
