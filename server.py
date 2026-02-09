@@ -4524,6 +4524,7 @@ async def clean_duplicates(
                         descriptions.append('')
             
             # If descriptions differ, skip this group
+            # Note: Empty descriptions ('') are treated as matching each other
             if len(set(descriptions)) > 1:
                 return
 
