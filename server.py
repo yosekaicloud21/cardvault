@@ -685,6 +685,15 @@ class CardIndexDB:
     def _row_to_entry(self, row: sqlite3.Row) -> CardEntry:
         """Convert database row to CardEntry."""
         tags = json.loads(row['tags']) if row['tags'] else []
+        
+        # Handle prohibited fields which may not exist in older databases
+        try:
+            prohibited = bool(row['prohibited'])
+            prohibited_reason = row['prohibited_reason'] or ''
+        except (KeyError, IndexError):
+            prohibited = False
+            prohibited_reason = ''
+        
         return CardEntry(
             file=row['file'],
             path=row['path'],
@@ -698,8 +707,8 @@ class CardIndexDB:
             indexed_at=row['indexed_at'],
             content_hash=row['content_hash'] or '',
             image_hash=row['image_hash'] or '',
-            prohibited=bool(row.get('prohibited', 0)),
-            prohibited_reason=row.get('prohibited_reason', '')
+            prohibited=prohibited,
+            prohibited_reason=prohibited_reason
         )
 
     def get_card_count(self) -> int:
