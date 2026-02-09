@@ -87,7 +87,7 @@ sudo systemctl start card-index
 | `DELETE /api/duplicates/clean` | Remove duplicates (keep one) |
 | `POST /api/duplicates/ignore` | Mark group as non-duplicate |
 | `GET /api/cards/similar` | Find similar cards |
-| `GET /api/prohibited` | View deleted prohibited cards |
+| `GET /api/prohibited` | View flagged prohibited cards |
 
 ### Index Management
 | Endpoint | Description |
@@ -123,7 +123,6 @@ sudo systemctl start card-index
 | `CARD_DIRS` | (required) | List of directories to index (see note below) |
 | `CARD_HOST` | `0.0.0.0` | Host to bind to |
 | `CARD_PORT` | `8787` | Port to bind to |
-| `CARD_AUTO_DELETE` | `true` | Auto-delete prohibited content |
 | `CARD_DETECT_DUPES` | `true` | Enable duplicate detection |
 | `CARD_DB_FILE` | `/var/lib/card-index/cards.db` | SQLite database file |
 | `CARD_WATCH_FILES` | `true` | Enable file watching for auto-detection |
@@ -144,7 +143,7 @@ Windows drive letters (like `C:`) are automatically detected and handled correct
 
 ## Prohibited Content Filtering
 
-**Warning: By default, CardVault uses strict content filtering that automatically deletes cards matching prohibited patterns. This may result in false positives.**
+CardVault uses strict content filtering to detect and flag cards matching prohibited patterns.
 
 ### How It Works
 
@@ -154,18 +153,18 @@ When a card is indexed, CardVault checks:
 3. **Age References** - Context-aware detection of minor age mentions
 
 Cards that match prohibited patterns are:
-- Logged to the prohibited deletions table (viewable at `/api/prohibited`)
-- **Automatically deleted from disk**
+- **Flagged as prohibited** and marked in the database
+- **NOT automatically deleted** - they remain on disk
+- Moved to a quarantine section where they can be reviewed
+- Excluded from regular search results by default
 
-### Disabling Auto-Delete
+### Managing Prohibited Cards
 
-To prevent automatic deletion, set in your `.env` file:
-
-```bash
-CARD_AUTO_DELETE=false
-```
-
-With this setting, prohibited cards will still be logged but **not deleted**.
+Flagged cards can be managed through the web interface:
+- **View**: See all flagged cards in the "Prohibited" tab
+- **Download**: Download flagged cards for manual review
+- **Approve**: Mark a card as safe (removes the prohibited flag)
+- **Delete**: Manually delete a card permanently
 
 ### Customizing the Blocklists
 
@@ -199,13 +198,11 @@ To customize:
 2. Modify the sets/lists as needed
 3. Restart the server
 
-### Viewing Deleted Cards
+### API Endpoints
 
-Check which cards were flagged and deleted:
-- **Web UI**: Click "Prohibited" tab in the dashboard
-- **API**: `GET /api/prohibited`
-
-This shows the filepath and matched patterns for each deleted card.
+- **GET** `/api/prohibited` - List flagged cards
+- **DELETE** `/api/prohibited/{card_id}` - Delete a flagged card
+- **POST** `/api/prohibited/{card_id}/approve` - Approve a flagged card
 
 ## Web Dashboard
 
