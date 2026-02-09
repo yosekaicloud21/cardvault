@@ -2,7 +2,7 @@
 """
 Character Card Index Server - SQLite Edition
 Monitors folders for character cards, indexes metadata, serves search API.
-Auto-deletes prohibited content and detects duplicates.
+Flags prohibited content for manual review and detects duplicates.
 
 Uses SQLite + FTS5 for fast full-text search at scale (200k+ cards).
 
@@ -12,7 +12,6 @@ Configuration via environment variables:
                         Example: C:/Cards/folder1:D:/Cards/folder2
   CARD_HOST           - Host to bind to (default: 0.0.0.0)
   CARD_PORT           - Port to bind to (default: 8787)
-  CARD_AUTO_DELETE    - Auto-delete prohibited content (default: true)
   CARD_DETECT_DUPES   - Detect duplicates (default: true)
   CARD_DB_FILE        - SQLite database file (default: /var/lib/card-index/cards.db)
 """
@@ -98,7 +97,7 @@ LOREBOOK_DIRS = parse_path_list(os.environ.get("LOREBOOK_DIRS", ""))
 HOST = os.environ.get("CARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CARD_PORT", "8787"))
 RECURSIVE = os.environ.get("CARD_RECURSIVE", "true").lower() == "true"
-AUTO_DELETE_PROHIBITED = os.environ.get("CARD_AUTO_DELETE", "true").lower() == "true"
+# AUTO_DELETE_PROHIBITED removed - now using manual review for prohibited content
 DETECT_DUPLICATES = os.environ.get("CARD_DETECT_DUPES", "true").lower() == "true"
 NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
 DB_FILE = os.environ.get("CARD_DB_FILE", "/var/lib/card-index/cards.db")
@@ -504,9 +503,17 @@ class CardIndexDB:
                     indexed_at TEXT NOT NULL,
                     content_hash TEXT DEFAULT '',
                     image_hash TEXT DEFAULT '',
-                    file_mtime REAL DEFAULT 0
+                    file_mtime REAL DEFAULT 0,
+                    prohibited INTEGER DEFAULT 0
                 )
             """)
+            
+            # Add prohibited column to existing cards tables (migration)
+            cur.execute("PRAGMA table_info(cards)")
+            columns = [row[1] for row in cur.fetchall()]
+            if 'prohibited' not in columns:
+                cur.execute("ALTER TABLE cards ADD COLUMN prohibited INTEGER DEFAULT 0")
+                logger.info("Added 'prohibited' column to cards table")
 
             # FTS5 virtual table for full-text search
             cur.execute("""
@@ -849,33 +856,67 @@ class CardIndexDB:
             logger.error(f"Error writing metadata to {filepath}: {e}")
             return False
 
-    def add_prohibited_deleted(self, path: str, tags: List[str]):
-        """Log a prohibited card deletion."""
+    def add_prohibited_flagged(self, path: str, tags: List[str]):
+        """Flag a card as prohibited without deleting it."""
         with self._cursor() as cur:
+            # Mark the card as prohibited in the cards table
             cur.execute(
-                "INSERT INTO prohibited_deleted (path, tags, deleted_at) VALUES (?, ?, ?)",
+                "UPDATE cards SET prohibited = 1 WHERE path = ?",
+                (path,)
+            )
+            # Log the prohibited patterns that matched
+            cur.execute(
+                "INSERT OR REPLACE INTO prohibited_deleted (path, tags, deleted_at) VALUES (?, ?, ?)",
                 (path, json.dumps(list(tags)), datetime.utcnow().isoformat())
             )
 
     def get_prohibited_deleted(self, limit: int = 100) -> List[dict]:
-        """Get list of prohibited deleted cards."""
+        """Get list of prohibited flagged cards."""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT path, tags, deleted_at FROM prohibited_deleted ORDER BY id DESC LIMIT ?",
                 (limit,)
             )
             return [
-                {"path": row[0], "tags": json.loads(row[1]), "deleted_at": row[2]}
+                {"path": row[0], "tags": json.loads(row[1]), "flagged_at": row[2]}
                 for row in cur.fetchall()
             ]
 
     def get_prohibited_count(self) -> int:
-        """Get count of prohibited deletions."""
+        """Get count of prohibited flagged cards."""
         with self._cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM prohibited_deleted")
+            cur.execute("SELECT COUNT(*) FROM cards WHERE prohibited = 1")
             return cur.fetchone()[0]
+    
+    def get_prohibited_cards(self) -> List[dict]:
+        """Get all cards flagged as prohibited."""
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT c.path, c.file, c.folder, c.name, c.creator, c.tags, 
+                       c.description_preview, c.nsfw, pd.tags as matched_patterns, 
+                       pd.deleted_at as flagged_at
+                FROM cards c
+                JOIN prohibited_deleted pd ON c.path = pd.path
+                WHERE c.prohibited = 1
+                ORDER BY pd.id DESC
+            """)
+            results = []
+            for row in cur.fetchall():
+                results.append({
+                    "path": row[0],
+                    "file": row[1],
+                    "folder": row[2],
+                    "name": row[3],
+                    "creator": row[4],
+                    "tags": json.loads(row[5]) if row[5] else [],
+                    "description_preview": row[6],
+                    "nsfw": bool(row[7]),
+                    "matched_patterns": json.loads(row[8]) if row[8] else [],
+                    "flagged_at": row[9]
+                })
+            return results
 
-    def index_card(self, filepath: str, delete_prohibited: bool = True) -> Optional[CardEntry]:
+    def index_card(self, filepath: str, delete_prohibited: bool = False) -> Optional[CardEntry]:
         """Index a single card file."""
         metadata = self.extract_metadata(filepath)
         if not metadata:
@@ -886,18 +927,12 @@ class CardIndexDB:
         description = data.get("description", "")
         first_mes = data.get("first_mes", "")
 
-        # Check for prohibited content
-        if AUTO_DELETE_PROHIBITED or delete_prohibited:
-            is_prohibited, blocked_items = check_prohibited_content(tags, description, first_mes)
-            if is_prohibited:
-                logger.warning(f"PROHIBITED: {filepath} - Matches: {blocked_items}")
-                self.add_prohibited_deleted(filepath, blocked_items)
-                try:
-                    os.remove(filepath)
-                    logger.info(f"DELETED prohibited: {filepath}")
-                except Exception as e:
-                    logger.error(f"Failed to delete {filepath}: {e}")
-                return None
+        # Check for prohibited content - now we flag instead of delete
+        is_prohibited, blocked_items = check_prohibited_content(tags, description, first_mes)
+        if is_prohibited:
+            logger.warning(f"PROHIBITED (FLAGGED): {filepath} - Matches: {blocked_items}")
+            # DO NOT DELETE - just flag it
+            # We will flag it after adding to cards table below
 
         # Determine NSFW
         nsfw = check_nsfw_content(tags, description, first_mes)
@@ -982,6 +1017,11 @@ class CardIndexDB:
                 logger.warning(f"INDEX: INSERT had rowcount=0 for {filepath}")
             elif exists_by_path:
                 logger.debug(f"INDEX: REPLACED existing entry at {entry.path}")
+        
+        # Flag the card as prohibited if needed (after it's in the database)
+        if is_prohibited:
+            self.add_prohibited_flagged(filepath, blocked_items)
+            logger.info(f"FLAGGED (not deleted) prohibited: {filepath}")
 
         return entry
 
@@ -2508,8 +2548,8 @@ DASHBOARD_HTML = """
 
         <div id="prohibited" class="tab-content">
             <div class="section">
-                <h2>Prohibited Content Log</h2>
-                <p style="color:#888;margin-bottom:15px;">Cards automatically deleted</p>
+                <h2>Prohibited Content - Manual Review</h2>
+                <p style="color:#888;margin-bottom:15px;">Cards flagged for manual review (not auto-deleted)</p>
                 <div id="prohibited-list"></div>
                 <div id="prohibited-loading" class="loading">Loading...</div>
             </div>
@@ -3195,15 +3235,81 @@ DASHBOARD_HTML = """
                 const res = await fetch('/api/prohibited');
                 const data = await res.json();
                 loading.style.display = 'none';
-                if (data.deleted.length === 0) {
-                    list.innerHTML = '<div class="empty">No prohibited cards deleted</div>';
+                if (data.cards.length === 0) {
+                    list.innerHTML = '<div class="empty">No prohibited cards flagged</div>';
                     return;
                 }
-                list.innerHTML = `<p style="margin-bottom:15px;">Total: ${data.total_deleted}</p><table><thead><tr><th>Path</th><th>Blocked Tags</th><th>Deleted At</th></tr></thead><tbody>${data.deleted.map(item => `<tr><td style="font-family:monospace;font-size:0.85rem;">${item.path}</td><td>${item.tags.map(t => `<span class="tag blocked">${t}</span>`).join('')}</td><td>${new Date(item.deleted_at).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
+                
+                // Display cards with preview, metadata, and action buttons
+                list.innerHTML = `<p style="margin-bottom:15px;">Total flagged: ${data.total_flagged}</p>`;
+                data.cards.forEach(card => {
+                    const cardDiv = document.createElement('div');
+                    cardDiv.className = 'prohibited-card';
+                    cardDiv.style.cssText = 'border:1px solid #444;border-radius:8px;padding:15px;margin-bottom:15px;display:flex;gap:15px;';
+                    
+                    // Card preview image
+                    const imgDiv = document.createElement('div');
+                    imgDiv.style.cssText = 'flex-shrink:0;';
+                    imgDiv.innerHTML = `<img src="/cards/${card.folder}/${card.file}" style="width:100px;height:150px;object-fit:cover;border-radius:4px;" onerror="this.style.display='none'"/>`;
+                    
+                    // Card info
+                    const infoDiv = document.createElement('div');
+                    infoDiv.style.cssText = 'flex-grow:1;';
+                    infoDiv.innerHTML = `
+                        <h3 style="margin:0 0 8px 0;color:#fff;">${card.name || 'Unnamed'}</h3>
+                        <p style="margin:4px 0;color:#aaa;"><strong>Creator:</strong> ${card.creator || 'Unknown'}</p>
+                        <p style="margin:4px 0;color:#aaa;"><strong>Path:</strong> <code style="font-size:0.85rem;">${card.path}</code></p>
+                        ${card.tags && card.tags.length > 0 ? `<p style="margin:8px 0;"><strong>Tags:</strong> ${card.tags.slice(0, 5).map(t => `<span class="tag">${t}</span>`).join('')}</p>` : ''}
+                        <p style="margin:8px 0;color:#e74c3c;"><strong>Matched Patterns:</strong> ${card.matched_patterns.map(t => `<span class="tag blocked">${t}</span>`).join('')}</p>
+                        <p style="margin:4px 0;color:#888;font-size:0.9rem;"><strong>Flagged:</strong> ${new Date(card.flagged_at).toLocaleString()}</p>
+                    `;
+                    
+                    // Action buttons
+                    const actionsDiv = document.createElement('div');
+                    actionsDiv.style.cssText = 'flex-shrink:0;display:flex;flex-direction:column;gap:8px;';
+                    actionsDiv.innerHTML = `
+                        <button class="btn btn-primary" onclick="viewCard('${card.path}')" style="font-size:0.9rem;padding:6px 12px;">View</button>
+                        <button class="btn" onclick="downloadCard('${card.path}')" style="font-size:0.9rem;padding:6px 12px;background:#3498db;">Download</button>
+                        <button class="btn btn-danger" onclick="deleteProhibited('${card.path}')" style="font-size:0.9rem;padding:6px 12px;">Delete</button>
+                    `;
+                    
+                    cardDiv.appendChild(imgDiv);
+                    cardDiv.appendChild(infoDiv);
+                    cardDiv.appendChild(actionsDiv);
+                    list.appendChild(cardDiv);
+                });
             } catch (e) {
                 loading.style.display = 'none';
-                list.innerHTML = '<div class="empty">Error loading prohibited log</div>';
+                list.innerHTML = '<div class="empty">Error loading prohibited cards</div>';
             }
+        }
+
+        async function deleteProhibited(path) {
+            if (!confirm('Permanently delete this card?')) return;
+            try {
+                const res = await fetch(`/api/prohibited/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+                const data = await res.json();
+                showToast('Card deleted');
+                loadProhibited();
+                loadStats();
+            } catch (e) {
+                showToast('Error deleting card', true);
+            }
+        }
+
+        function viewCard(path) {
+            // Navigate to card detail page
+            const parts = path.split('/');
+            const filename = parts[parts.length - 1];
+            const folder = parts[parts.length - 2];
+            window.location.href = `/api/cards/${folder}/${filename}`;
+        }
+
+        function downloadCard(path) {
+            const parts = path.split('/');
+            const filename = parts[parts.length - 1];
+            const folder = parts[parts.length - 2];
+            window.location.href = `/cards/${folder}/${filename}`;
         }
 
         async function loadTags() {
@@ -3927,7 +4033,7 @@ async def api_info():
         "prohibited_deleted": index.get_prohibited_count(),
         "duplicate_groups": len(duplicates),
         "config": {
-            "auto_delete_prohibited": AUTO_DELETE_PROHIBITED,
+            "auto_delete_prohibited": False,  # Always false - manual review only
             "detect_duplicates": DETECT_DUPLICATES,
             "database": DB_FILE
         },
@@ -4252,12 +4358,22 @@ async def debug_paths(
 
 @app.get("/api/prohibited")
 async def get_prohibited():
-    """Get list of prohibited cards that were deleted."""
+    """Get list of prohibited cards flagged for manual review."""
+    prohibited_cards = index.get_prohibited_cards()
     return {
-        "total_deleted": index.get_prohibited_count(),
-        "auto_delete_enabled": AUTO_DELETE_PROHIBITED,
-        "deleted": index.get_prohibited_deleted(100)
+        "total_flagged": len(prohibited_cards),
+        "auto_delete_enabled": False,  # Always false now - manual review only
+        "cards": prohibited_cards
     }
+
+
+@app.delete("/api/prohibited/delete")
+async def delete_prohibited_card(path: str = Query(...)):
+    """Manually delete a prohibited card after review."""
+    if index.delete_card(path):
+        return {"success": True, "deleted": path}
+    else:
+        raise HTTPException(status_code=404, detail="Card not found")
 
 
 @app.get("/api/duplicates")
