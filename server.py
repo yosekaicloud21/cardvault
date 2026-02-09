@@ -119,8 +119,7 @@ BLOCKED_TAGS_EXACT = {
     "child", "children", "underage", "minor", "minors",
     "kid", "kids", "toddler", "infant", "preteen", "prepubescent",
     "young child", "little girl", "little boy", "cub", "cubs",
-    "pedophilia", "pedo", "cp", "csam", "jailbait", "incest",
-    "loli", "lolicon", "shota", "shotacon"
+    "pedophilia", "pedo", "cp", "csam", "jailbait", "incest"
 }
 BLOCKED_PATTERNS = [re.compile(r'\bloli'), re.compile(r'\bshota'), re.compile(r'\brape')]
 
@@ -361,67 +360,6 @@ def check_prohibited_content_smart(tags: List[str], description: str = "", first
         return "quarantine", snippets, "Minor age mentioned - needs manual review"
 
     return "safe", set(), "No prohibited content found"
-
-
-def check_quarantine_content(tags: List[str], description: str = "", first_mes: str = "") -> Tuple[bool, set, str]:
-    """
-    Check if content should be quarantined based on:
-    1. Blocked tag words appearing in description/first_mes
-    2. Blocked words in actual tags
-    3. Age mentions under 18
-    
-    Returns: (should_quarantine, matches, reason)
-    """
-    matches = set()
-    full_text = f"{description} {first_mes}".lower()
-    
-    # Check 1: Look for blocked tag words in description text
-    for blocked_word in BLOCKED_TAGS_EXACT:
-        # Use word boundaries to avoid false positives
-        pattern = r'\b' + re.escape(blocked_word.lower()) + r'\b'
-        if re.search(pattern, full_text):
-            matches.add(f"Description contains: '{blocked_word}'")
-    
-    # Check 2: Look for blocked tag words in actual tags
-    tags_lower = [t.lower() for t in tags]
-    for tag in tags_lower:
-        if tag in BLOCKED_TAGS_EXACT:
-            matches.add(f"Tag: '{tag}'")
-        else:
-            for pattern in BLOCKED_PATTERNS:
-                if pattern.search(tag):
-                    matches.add(f"Tag pattern: '{tag}'")
-                    break
-    
-    # Check 3: Look for age mentions under 18
-    age_found = False
-    for pattern in AGE_PATTERNS_CONTEXT:
-        for match in pattern.finditer(full_text):
-            matched_text = match.group()
-            # Try to extract the number
-            age_num = None
-            # Look for patterns like "age: 15", "age 15", "15 years old", etc.
-            num_match = re.search(r'(\d+)', matched_text)
-            if num_match:
-                age_num = int(num_match.group(1))
-                if age_num < 18:
-                    # Get context around the match
-                    start = max(0, match.start() - 30)
-                    end = min(len(full_text), match.end() + 30)
-                    context = full_text[start:end].replace('\n', ' ')
-                    matches.add(f"Age under 18: ...{context}...")
-                    age_found = True
-    
-    if matches:
-        reasons = []
-        if any("Description contains" in m or "Tag" in m for m in matches):
-            reasons.append("blocked content detected")
-        if age_found:
-            reasons.append("minor age mention")
-        reason = " + ".join(reasons).capitalize()
-        return True, matches, reason
-    
-    return False, set(), ""
 
 
 def parse_name_from_filename(filename: str, extensions: List[str] = None) -> Tuple[str, str]:
@@ -976,8 +914,10 @@ class CardIndexDB:
         personality = data.get("personality", "")
         scenario = data.get("scenario", "")
 
-        # Check for quarantine content (blocked tags in description + age mentions)
-        should_quarantine, matches, reason = check_quarantine_content(tags, description, first_mes)
+        # Check for prohibited content and log to quarantine (NO AUTO-DELETE)
+        status, matches, reason = check_prohibited_content_smart(
+            tags, description, first_mes, personality, scenario
+        )
 
         # Determine NSFW
         nsfw = check_nsfw_content(tags, description, first_mes)
@@ -1064,9 +1004,9 @@ class CardIndexDB:
                 logger.debug(f"INDEX: REPLACED existing entry at {entry.path}")
         
         # Log to quarantine for manual review if needed (NEVER auto-delete)
-        if should_quarantine:
-            logger.warning(f"QUARANTINE: {filepath} - {reason} - Matches: {matches}")
-            self.add_quarantine(filepath, list(matches), "flagged", reason)
+        if status in ["block", "quarantine"]:
+            logger.warning(f"QUARANTINE: {filepath} - {status.upper()} - {reason} - Matches: {matches}")
+            self.add_quarantine(filepath, list(matches), status, reason)
             # Continue indexing - card is still accessible, just flagged for review
 
         return entry
@@ -2596,7 +2536,6 @@ DASHBOARD_HTML = """
             <div class="section">
                 <h2>Quarantine</h2>
                 <p style="color:#888;margin-bottom:15px;">Flagged cards for manual review - no files are deleted automatically</p>
-                <button class="btn btn-danger" onclick="deleteAllQuarantine()" id="delete-all-quarantine-btn" style="margin-bottom:15px;">Delete All</button>
                 <div id="quarantine-list"></div>
                 <div id="quarantine-loading" class="loading">Loading...</div>
             </div>
@@ -3284,47 +3223,32 @@ DASHBOARD_HTML = """
                 loading.style.display = 'none';
                 if (data.cards.length === 0) {
                     list.innerHTML = '<div class="empty">No cards in quarantine</div>';
-                    document.getElementById('delete-all-quarantine-btn').style.display = 'none';
                     return;
                 }
                 
-                document.getElementById('delete-all-quarantine-btn').style.display = 'block';
-                
-                let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px;">';
+                let html = '<div class="card-grid">';
                 data.cards.forEach(card => {
                     const statusColor = card.status === 'block' ? '#e74c3c' : '#f39c12';
                     const statusLabel = card.status === 'block' ? 'HIGH PRIORITY' : 'REVIEW';
                     
-                    // Extract folder and filename for image URL
-                    const parts = card.path.split(/[\\/]/);
-                    const filename = parts.pop();
-                    const folder = parts.pop();
-                    const imageUrl = `/cards/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
-                    
                     html += `
-                        <div class="card" style="border-left:4px solid ${statusColor};padding:15px;">
-                            <div style="margin-bottom:10px;">
-                                <a href="${imageUrl}" target="_blank" style="display:block;">
-                                    <img src="${imageUrl}" style="width:100%;height:200px;object-fit:cover;border-radius:8px;cursor:pointer;" 
-                                         onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22><rect fill=%22%23ddd%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%23999%22>No Image</text></svg>'">
-                                </a>
+                        <div class="card" style="border-left:4px solid ${statusColor}">
+                            <div style="font-size:13px;color:#555;margin-bottom:8px;">
+                                ${card.path}
+                                <span style="background:${statusColor};color:white;padding:2px 8px;border-radius:3px;font-size:11px;margin-left:8px;">${statusLabel}</span>
                             </div>
-                            <div style="font-size:12px;color:#555;margin-bottom:8px;word-break:break-all;">
-                                <strong>${filename}</strong>
-                                <span style="background:${statusColor};color:white;padding:2px 6px;border-radius:3px;font-size:10px;margin-left:4px;">${statusLabel}</span>
-                            </div>
-                            <div style="font-size:11px;color:#888;margin-bottom:6px;">
+                            <div style="font-size:12px;color:#888;margin-bottom:4px;">
                                 <strong>Reason:</strong> ${card.reason || 'N/A'}
                             </div>
-                            <div style="font-size:11px;color:#888;margin-bottom:8px;max-height:60px;overflow-y:auto;">
-                                <strong>Matches:</strong><br>${card.matches.join('<br>')}
+                            <div style="font-size:12px;color:#888;margin-bottom:8px;word-break:break-word;">
+                                <strong>Matches:</strong> ${card.matches.join(', ')}
                             </div>
-                            <div style="font-size:10px;color:#aaa;margin-bottom:10px;">
+                            <div style="font-size:11px;color:#aaa;margin-bottom:8px;">
                                 Flagged: ${new Date(card.quarantined_at).toLocaleString()}
                             </div>
                             <div style="display:flex;gap:8px;">
-                                <button class="btn btn-sm" onclick="approveCard('${card.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'); return false;" style="background:#27ae60;flex:1;">Approve</button>
-                                <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'); return false;" style="flex:1;">Delete</button>
+                                <button class="btn btn-sm" onclick="viewCard('${card.path.replace(/'/g, "\\'")}')">View Card</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Delete</button>
                             </div>
                         </div>
                     `;
@@ -3337,32 +3261,12 @@ DASHBOARD_HTML = """
             }
         }
 
-        async function approveCard(path) {
-            if (!confirm(`Approve this card and remove from quarantine?\n\n${path}`)) return;
-            try {
-                const res = await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' });
-                if (res.ok) {
-                    showToast('Card approved');
-                    loadQuarantine();
-                    loadStats();
-                } else {
-                    showToast('Failed to approve card', true);
-                }
-            } catch (e) {
-                showToast('Error approving card', true);
-            }
-        }
-
         async function deleteQuarantinedCard(path) {
             if (!confirm(`Delete this card permanently?\n\n${path}`)) return;
             try {
                 const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
                 if (res.ok) {
                     showToast('Card deleted');
-                    // Also remove from quarantine table
-                    await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' }).catch((err) => {
-                        console.warn('Failed to cleanup quarantine entry:', err);
-                    });
                     loadQuarantine();
                     loadStats();
                 } else {
@@ -3373,33 +3277,12 @@ DASHBOARD_HTML = """
             }
         }
 
-        async function deleteAllQuarantine() {
-            const res = await fetch('/api/quarantine');
-            const data = await res.json();
-            const count = data.cards.length;
-            
-            if (count === 0) {
-                showToast('No cards in quarantine');
-                return;
-            }
-            
-            if (!confirm(`Delete ALL ${count} cards in quarantine permanently?\n\nThis cannot be undone!`)) return;
-            
-            document.getElementById('delete-all-quarantine-btn').disabled = true;
-            try {
-                const res = await fetch('/api/quarantine/delete-all', { method: 'DELETE' });
-                const data = await res.json();
-                if (res.ok) {
-                    showToast(`Deleted ${data.deleted_count} cards`);
-                    loadQuarantine();
-                    loadStats();
-                } else {
-                    showToast('Failed to delete all cards', true);
-                }
-            } catch (e) {
-                showToast('Error deleting cards', true);
-            }
-            document.getElementById('delete-all-quarantine-btn').disabled = false;
+        async function viewCard(path) {
+            // Extract folder and filename from path
+            const parts = path.split(/[\\/]/);
+            const filename = parts.pop();
+            const folder = parts.pop();
+            window.open(`/cards/${folder}/${filename}`, '_blank');
         }
 
         async function loadTags() {
@@ -4468,54 +4351,6 @@ async def delete_prohibited_card(path: str = Query(...)):
         return {"success": True, "deleted": path}
     else:
         raise HTTPException(status_code=404, detail="Card not found")
-
-
-@app.post("/api/quarantine/approve")
-async def approve_quarantine(path: str = Query(..., description="Path to approve")):
-    """Remove a card from quarantine (approve it)."""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM quarantine WHERE path = ?", (path,))
-            conn.commit()
-            if c.rowcount > 0:
-                return {"success": True, "message": "Card approved"}
-            else:
-                raise HTTPException(status_code=404, detail="Card not found in quarantine")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/quarantine/delete-all")
-async def delete_all_quarantine():
-    """Delete all cards in quarantine from disk and database."""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            # Get all quarantined paths
-            c.execute("SELECT path FROM quarantine")
-            paths = [row[0] for row in c.fetchall()]
-            
-            deleted_count = 0
-            db_cleaned = 0
-            for path in paths:
-                try:
-                    # Delete from main cards table
-                    c.execute("DELETE FROM cards WHERE path = ?", (path,))
-                    db_cleaned += 1
-                    # Delete file from disk
-                    if os.path.exists(path):
-                        os.remove(path)
-                        deleted_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to delete {path}: {e}")
-            
-            # Clear quarantine table
-            c.execute("DELETE FROM quarantine")
-            conn.commit()
-            
-            return {"success": True, "deleted_count": deleted_count, "db_cleaned": db_cleaned, "total_paths": len(paths)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/duplicates")
