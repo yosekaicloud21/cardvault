@@ -2,7 +2,7 @@
 """
 Character Card Index Server - SQLite Edition
 Monitors folders for character cards, indexes metadata, serves search API.
-Auto-deletes prohibited content and detects duplicates.
+Detects prohibited content and duplicates.
 
 Uses SQLite + FTS5 for fast full-text search at scale (200k+ cards).
 
@@ -12,7 +12,6 @@ Configuration via environment variables:
                         Example: C:/Cards/folder1:D:/Cards/folder2
   CARD_HOST           - Host to bind to (default: 0.0.0.0)
   CARD_PORT           - Port to bind to (default: 8787)
-  CARD_AUTO_DELETE    - Auto-delete prohibited content (default: true)
   CARD_DETECT_DUPES   - Detect duplicates (default: true)
   CARD_DB_FILE        - SQLite database file (default: /var/lib/card-index/cards.db)
 """
@@ -98,7 +97,6 @@ LOREBOOK_DIRS = parse_path_list(os.environ.get("LOREBOOK_DIRS", ""))
 HOST = os.environ.get("CARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CARD_PORT", "8787"))
 RECURSIVE = os.environ.get("CARD_RECURSIVE", "true").lower() == "true"
-AUTO_DELETE_PROHIBITED = os.environ.get("CARD_AUTO_DELETE", "true").lower() == "true"
 DETECT_DUPLICATES = os.environ.get("CARD_DETECT_DUPES", "true").lower() == "true"
 NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
 DB_FILE = os.environ.get("CARD_DB_FILE", "/var/lib/card-index/cards.db")
@@ -441,6 +439,8 @@ class CardEntry:
     indexed_at: str
     content_hash: str = ""
     image_hash: str = ""
+    prohibited: bool = False
+    prohibited_reason: str = ""
 
 
 class CardIndexDB:
@@ -504,7 +504,9 @@ class CardIndexDB:
                     indexed_at TEXT NOT NULL,
                     content_hash TEXT DEFAULT '',
                     image_hash TEXT DEFAULT '',
-                    file_mtime REAL DEFAULT 0
+                    file_mtime REAL DEFAULT 0,
+                    prohibited INTEGER DEFAULT 0,
+                    prohibited_reason TEXT DEFAULT ''
                 )
             """)
 
@@ -664,9 +666,19 @@ class CardIndexDB:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_creator ON cards(creator)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_nsfw ON cards(nsfw)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_path ON cards(path)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_prohibited ON cards(prohibited)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_lorebooks_creator ON lorebooks(creator)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_lorebooks_nsfw ON lorebooks(nsfw)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_lorebooks_chub_id ON lorebooks(chub_id)")
+
+            # Migration: Add prohibited columns if they don't exist
+            cur.execute("PRAGMA table_info(cards)")
+            columns = [row[1] for row in cur.fetchall()]
+            if 'prohibited' not in columns:
+                logger.info("Migrating database: adding prohibited columns")
+                cur.execute("ALTER TABLE cards ADD COLUMN prohibited INTEGER DEFAULT 0")
+                cur.execute("ALTER TABLE cards ADD COLUMN prohibited_reason TEXT DEFAULT ''")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_prohibited ON cards(prohibited)")
 
         logger.info(f"Database initialized at {self.db_path}")
 
@@ -685,13 +697,15 @@ class CardIndexDB:
             first_mes_preview=row['first_mes_preview'],
             indexed_at=row['indexed_at'],
             content_hash=row['content_hash'] or '',
-            image_hash=row['image_hash'] or ''
+            image_hash=row['image_hash'] or '',
+            prohibited=bool(row.get('prohibited', 0)),
+            prohibited_reason=row.get('prohibited_reason', '')
         )
 
     def get_card_count(self) -> int:
-        """Get total number of indexed cards."""
+        """Get total number of indexed cards (excluding prohibited)."""
         with self._cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM cards")
+            cur.execute("SELECT COUNT(*) FROM cards WHERE prohibited = 0")
             return cur.fetchone()[0]
 
     def get_card_by_path(self, path: str) -> Optional[CardEntry]:
@@ -887,17 +901,12 @@ class CardIndexDB:
         first_mes = data.get("first_mes", "")
 
         # Check for prohibited content
-        if AUTO_DELETE_PROHIBITED or delete_prohibited:
-            is_prohibited, blocked_items = check_prohibited_content(tags, description, first_mes)
-            if is_prohibited:
-                logger.warning(f"PROHIBITED: {filepath} - Matches: {blocked_items}")
-                self.add_prohibited_deleted(filepath, blocked_items)
-                try:
-                    os.remove(filepath)
-                    logger.info(f"DELETED prohibited: {filepath}")
-                except Exception as e:
-                    logger.error(f"Failed to delete {filepath}: {e}")
-                return None
+        is_prohibited, blocked_items = check_prohibited_content(tags, description, first_mes)
+        prohibited_reason = ""
+
+        if is_prohibited:
+            logger.warning(f"PROHIBITED (not deleted): {filepath} - Matches: {blocked_items}")
+            prohibited_reason = ", ".join(blocked_items)
 
         # Determine NSFW
         nsfw = check_nsfw_content(tags, description, first_mes)
@@ -957,7 +966,9 @@ class CardIndexDB:
             first_mes_preview=first_mes[:300] if first_mes else "",
             indexed_at=datetime.utcnow().isoformat(),
             content_hash=content_hash,
-            image_hash=image_hash
+            image_hash=image_hash,
+            prohibited=is_prohibited,
+            prohibited_reason=prohibited_reason
         )
 
         # Insert or update in database
@@ -969,13 +980,13 @@ class CardIndexDB:
             cur.execute("""
                 INSERT OR REPLACE INTO cards
                 (path, file, folder, name, creator, tags, nsfw, description_preview,
-                 first_mes_preview, indexed_at, content_hash, image_hash, file_mtime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 first_mes_preview, indexed_at, content_hash, image_hash, file_mtime, prohibited, prohibited_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entry.path, entry.file, entry.folder, entry.name, entry.creator,
                 json.dumps(entry.tags), int(entry.nsfw), entry.description_preview,
                 entry.first_mes_preview, entry.indexed_at, entry.content_hash,
-                entry.image_hash, file_mtime
+                entry.image_hash, file_mtime, int(is_prohibited), prohibited_reason
             ))
             # Log rowcount to verify insert
             if cur.rowcount == 0:
@@ -1098,6 +1109,7 @@ class CardIndexDB:
         nsfw: Optional[bool] = None,
         creator: Optional[str] = None,
         folder: Optional[str] = None,
+        include_prohibited: bool = False,
         limit: int = 50,
         offset: int = 0
     ) -> Tuple[List[CardEntry], int]:
@@ -1134,6 +1146,10 @@ class CardIndexDB:
         if folder:
             conditions.append("cards.folder = ?")
             params.append(folder)
+
+        # Exclude prohibited cards by default
+        if not include_prohibited:
+            conditions.append("cards.prohibited = 0")
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
@@ -1214,27 +1230,32 @@ class CardIndexDB:
     def get_stats(self) -> dict:
         """Get index statistics."""
         with self._cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM cards")
+            cur.execute("SELECT COUNT(*) FROM cards WHERE prohibited = 0")
             total = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(*) FROM cards WHERE nsfw = 1")
+            cur.execute("SELECT COUNT(*) FROM cards WHERE prohibited = 1")
+            prohibited_count = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM cards WHERE nsfw = 1 AND prohibited = 0")
             nsfw_count = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(DISTINCT creator) FROM cards")
+            cur.execute("SELECT COUNT(DISTINCT creator) FROM cards WHERE prohibited = 0")
             unique_creators = cur.fetchone()[0]
 
-            cur.execute("SELECT folder, COUNT(*) FROM cards GROUP BY folder")
+            cur.execute("SELECT folder, COUNT(*) FROM cards WHERE prohibited = 0 GROUP BY folder")
             folders = {row[0]: row[1] for row in cur.fetchall()}
 
             # Top creators
             cur.execute("""
                 SELECT creator, COUNT(*) as cnt FROM cards
+                WHERE prohibited = 0
                 GROUP BY creator ORDER BY cnt DESC LIMIT 50
             """)
             top_creators = [(row[0], row[1]) for row in cur.fetchall()]
 
         return {
             "total_cards": total,
+            "prohibited_flagged": prohibited_count,
             "nsfw_count": nsfw_count,
             "sfw_count": total - nsfw_count,
             "unique_creators": unique_creators,
@@ -2507,8 +2528,11 @@ DASHBOARD_HTML = """
 
         <div id="prohibited" class="tab-content">
             <div class="section">
-                <h2>Prohibited Content Log</h2>
-                <p style="color:#888;margin-bottom:15px;">Cards automatically deleted</p>
+                <h2>Prohibited Content Review</h2>
+                <p style="color:#888;margin-bottom:15px;">
+                    Cards flagged for prohibited content. Review, approve, or delete manually.
+                </p>
+                <div id="prohibited-stats" style="margin-bottom:20px;"></div>
                 <div id="prohibited-list"></div>
                 <div id="prohibited-loading" class="loading">Loading...</div>
             </div>
@@ -3175,19 +3199,104 @@ DASHBOARD_HTML = """
         async function loadProhibited() {
             const list = document.getElementById('prohibited-list');
             const loading = document.getElementById('prohibited-loading');
+            const stats = document.getElementById('prohibited-stats');
+            
             try {
                 const res = await fetch('/api/prohibited');
                 const data = await res.json();
                 loading.style.display = 'none';
-                if (data.deleted.length === 0) {
-                    list.innerHTML = '<div class="empty">No prohibited cards deleted</div>';
+                
+                stats.innerHTML = `<div style="padding:10px;background:#2a2a2a;border-radius:5px;">
+                    <strong>${data.total}</strong> cards flagged for review
+                </div>`;
+                
+                if (data.cards.length === 0) {
+                    list.innerHTML = '<div class="empty">No prohibited cards</div>';
                     return;
                 }
-                list.innerHTML = `<p style="margin-bottom:15px;">Total: ${data.total_deleted}</p><table><thead><tr><th>Path</th><th>Blocked Tags</th><th>Deleted At</th></tr></thead><tbody>${data.deleted.map(item => `<tr><td style="font-family:monospace;font-size:0.85rem;">${item.path}</td><td>${item.tags.map(t => `<span class="tag blocked">${t}</span>`).join('')}</td><td>${new Date(item.deleted_at).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
+                
+                let html = '<div style="display:grid;gap:15px;">';
+                for (const card of data.cards) {
+                    const downloadUrl = `/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}`;
+                    const viewUrl = `/api/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}`;
+                    
+                    html += `
+                        <div class="card-item" style="border:2px solid #e74c3c;">
+                            <div style="display:flex;gap:15px;">
+                                <img src="${downloadUrl}" style="width:120px;height:120px;object-fit:cover;border-radius:5px;" 
+                                     onerror="this.style.display='none'">
+                                <div style="flex:1;">
+                                    <h3 style="margin:0 0 5px 0;">${escapeHtml(card.name)}</h3>
+                                    <div style="color:#888;font-size:0.9em;margin-bottom:8px;">
+                                        by ${escapeHtml(card.creator)}
+                                    </div>
+                                    <div style="background:#4a1a1a;padding:8px;border-radius:4px;margin-bottom:10px;">
+                                        <strong style="color:#e74c3c;">⚠ Flagged:</strong> 
+                                        <span style="color:#fff;">${escapeHtml(card.prohibited_reason)}</span>
+                                    </div>
+                                    ${card.tags.slice(0, 5).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}
+                                    <div style="margin-top:10px;">
+                                        <button class="btn btn-primary" onclick="window.open('${viewUrl}', '_blank')" 
+                                                style="background:#3498db;margin-right:5px;">
+                                            View Full Card
+                                        </button>
+                                        <button class="btn btn-primary" onclick="window.open('${downloadUrl}', '_blank')" 
+                                                style="background:#27ae60;margin-right:5px;">
+                                            Download
+                                        </button>
+                                        <button class="btn btn-success" onclick="approveProhibited(${card.id})" 
+                                                style="background:#2ecc71;margin-right:5px;">
+                                            Approve (Not Prohibited)
+                                        </button>
+                                        <button class="btn btn-danger" onclick="deleteProhibited(${card.id}, '${escapeHtml(card.name)}')">
+                                            Delete Permanently
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
+                html += '</div>';
+                list.innerHTML = html;
             } catch (e) {
                 loading.style.display = 'none';
-                list.innerHTML = '<div class="empty">Error loading prohibited log</div>';
+                list.innerHTML = '<div class="empty">Error loading prohibited cards</div>';
             }
+        }
+
+        async function deleteProhibited(cardId, cardName) {
+            if (!confirm(`Permanently delete "${cardName}"?`)) return;
+            
+            try {
+                const res = await fetch(`/api/prohibited/${cardId}`, { method: 'DELETE' });
+                const data = await res.json();
+                showToast(`Deleted: ${cardName}`);
+                loadProhibited();
+                loadStats();
+            } catch (e) {
+                showToast('Error deleting card', true);
+            }
+        }
+
+        async function approveProhibited(cardId) {
+            if (!confirm('Mark this card as approved (not prohibited)?')) return;
+            
+            try {
+                const res = await fetch(`/api/prohibited/${cardId}/approve`, { method: 'POST' });
+                const data = await res.json();
+                showToast('Card approved and moved to main index');
+                loadProhibited();
+                loadStats();
+            } catch (e) {
+                showToast('Error approving card', true);
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         async function loadTags() {
@@ -3908,10 +4017,9 @@ async def api_info():
         "service": "Character Card Index",
         "version": "2.0.0-sqlite",
         "total_cards": index.get_card_count(),
-        "prohibited_deleted": index.get_prohibited_count(),
+        "prohibited_flagged": index.get_stats()["prohibited_flagged"],
         "duplicate_groups": len(duplicates),
         "config": {
-            "auto_delete_prohibited": AUTO_DELETE_PROHIBITED,
             "detect_duplicates": DETECT_DUPLICATES,
             "database": DB_FILE
         },
@@ -3998,11 +4106,11 @@ async def get_stats():
 
     return {
         "total_cards": stats["total_cards"],
+        "prohibited_flagged": stats["prohibited_flagged"],
         "nsfw_count": stats["nsfw_count"],
         "sfw_count": stats["sfw_count"],
         "unique_creators": stats["unique_creators"],
         "unique_tags": len(tags),
-        "prohibited_deleted": index.get_prohibited_count(),
         "content_duplicate_groups": len([p for p in duplicates.values() if len(p) > 1]),
         "image_duplicate_groups": len([p for p in image_duplicates.values() if len(p) > 1]),
         "image_hash_enabled": IMAGE_HASH_AVAILABLE,
@@ -4235,13 +4343,102 @@ async def debug_paths(
 
 
 @app.get("/api/prohibited")
-async def get_prohibited():
-    """Get list of prohibited cards that were deleted."""
-    return {
-        "total_deleted": index.get_prohibited_count(),
-        "auto_delete_enabled": AUTO_DELETE_PROHIBITED,
-        "deleted": index.get_prohibited_deleted(100)
-    }
+async def get_prohibited_cards(limit: int = 100, offset: int = 0):
+    """Get list of prohibited cards (not deleted, just flagged)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        # Get total count
+        c.execute("SELECT COUNT(*) FROM cards WHERE prohibited = 1")
+        total = c.fetchone()[0]
+        
+        # Get prohibited cards
+        c.execute("""
+            SELECT id, path, file, folder, name, creator, tags, nsfw, 
+                   description_preview, first_mes_preview, indexed_at,
+                   prohibited_reason
+            FROM cards 
+            WHERE prohibited = 1 
+            ORDER BY indexed_at DESC 
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        cards = []
+        for row in c.fetchall():
+            cards.append({
+                "id": row["id"],
+                "path": row["path"],
+                "file": row["file"],
+                "folder": row["folder"],
+                "name": row["name"],
+                "creator": row["creator"],
+                "tags": json.loads(row["tags"]),
+                "nsfw": bool(row["nsfw"]),
+                "description_preview": row["description_preview"],
+                "first_mes_preview": row["first_mes_preview"],
+                "indexed_at": row["indexed_at"],
+                "prohibited_reason": row["prohibited_reason"]
+            })
+        
+        return {
+            "total": total,
+            "cards": cards,
+            "limit": limit,
+            "offset": offset
+        }
+
+
+@app.delete("/api/prohibited/{card_id}")
+async def delete_prohibited_card(card_id: int):
+    """Manually delete a prohibited card."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        # Get card path
+        c.execute("SELECT path, prohibited FROM cards WHERE id = ?", (card_id,))
+        row = c.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Card not found")
+        
+        if not row["prohibited"]:
+            raise HTTPException(status_code=400, detail="Card is not marked as prohibited")
+        
+        path = row["path"]
+        
+        # Delete file and database entry
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            c.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+            conn.commit()
+            logger.info(f"Manually deleted prohibited card: {path}")
+            return {"success": True, "deleted": path}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
+
+@app.post("/api/prohibited/{card_id}/approve")
+async def approve_prohibited_card(card_id: int):
+    """Approve a prohibited card (unmark it)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        
+        c.execute("SELECT id FROM cards WHERE id = ? AND prohibited = 1", (card_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Prohibited card not found")
+        
+        c.execute("""
+            UPDATE cards 
+            SET prohibited = 0, prohibited_reason = '' 
+            WHERE id = ?
+        """, (card_id,))
+        conn.commit()
+        
+        logger.info(f"Approved prohibited card ID: {card_id}")
+        return {"success": True, "approved": card_id}
 
 
 @app.get("/api/duplicates")
