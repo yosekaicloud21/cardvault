@@ -1063,11 +1063,11 @@ class CardIndexDB:
             elif exists_by_path:
                 logger.debug(f"INDEX: REPLACED existing entry at {entry.path}")
         
-        # Log to quarantine for manual review if needed (NEVER auto-delete)
+        # Log to quarantine for manual review if needed (AFTER successful indexing)
         if should_quarantine:
             logger.warning(f"QUARANTINE: {filepath} - {reason} - Matches: {matches}")
             self.add_quarantine(filepath, list(matches), "flagged", reason)
-            # Continue indexing - card is still accessible, just flagged for review
+            # Card is still indexed and accessible, just flagged for review
 
         return entry
 
