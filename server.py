@@ -3284,7 +3284,6 @@ DASHBOARD_HTML = """
             const folder = parts.pop();
             window.open(`/cards/${folder}/${filename}`, '_blank');
         }
-        }
 
         async function loadTags() {
             const list = document.getElementById('tags-list');
