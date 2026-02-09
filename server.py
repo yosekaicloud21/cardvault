@@ -916,7 +916,7 @@ class CardIndexDB:
                 })
             return results
 
-    def index_card(self, filepath: str, delete_prohibited: bool = False) -> Optional[CardEntry]:
+    def index_card(self, filepath: str) -> Optional[CardEntry]:
         """Index a single card file."""
         metadata = self.extract_metadata(filepath)
         if not metadata:
@@ -3250,28 +3250,52 @@ DASHBOARD_HTML = """
                     // Card preview image
                     const imgDiv = document.createElement('div');
                     imgDiv.style.cssText = 'flex-shrink:0;';
-                    imgDiv.innerHTML = `<img src="/cards/${card.folder}/${card.file}" style="width:100px;height:150px;object-fit:cover;border-radius:4px;" onerror="this.style.display='none'"/>`;
+                    imgDiv.innerHTML = `<img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}" style="width:100px;height:150px;object-fit:cover;border-radius:4px;" onerror="this.style.display='none'"/>`;
                     
                     // Card info
                     const infoDiv = document.createElement('div');
                     infoDiv.style.cssText = 'flex-grow:1;';
+                    const escapeHtml = (text) => {
+                        const div = document.createElement('div');
+                        div.textContent = text;
+                        return div.innerHTML;
+                    };
                     infoDiv.innerHTML = `
-                        <h3 style="margin:0 0 8px 0;color:#fff;">${card.name || 'Unnamed'}</h3>
-                        <p style="margin:4px 0;color:#aaa;"><strong>Creator:</strong> ${card.creator || 'Unknown'}</p>
-                        <p style="margin:4px 0;color:#aaa;"><strong>Path:</strong> <code style="font-size:0.85rem;">${card.path}</code></p>
-                        ${card.tags && card.tags.length > 0 ? `<p style="margin:8px 0;"><strong>Tags:</strong> ${card.tags.slice(0, 5).map(t => `<span class="tag">${t}</span>`).join('')}</p>` : ''}
-                        <p style="margin:8px 0;color:#e74c3c;"><strong>Matched Patterns:</strong> ${card.matched_patterns.map(t => `<span class="tag blocked">${t}</span>`).join('')}</p>
+                        <h3 style="margin:0 0 8px 0;color:#fff;">${escapeHtml(card.name || 'Unnamed')}</h3>
+                        <p style="margin:4px 0;color:#aaa;"><strong>Creator:</strong> ${escapeHtml(card.creator || 'Unknown')}</p>
+                        <p style="margin:4px 0;color:#aaa;"><strong>Path:</strong> <code style="font-size:0.85rem;">${escapeHtml(card.path)}</code></p>
+                        ${card.tags && card.tags.length > 0 ? `<p style="margin:8px 0;"><strong>Tags:</strong> ${card.tags.slice(0, 5).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}</p>` : ''}
+                        <p style="margin:8px 0;color:#e74c3c;"><strong>Matched Patterns:</strong> ${card.matched_patterns.map(t => `<span class="tag blocked">${escapeHtml(t)}</span>`).join('')}</p>
                         <p style="margin:4px 0;color:#888;font-size:0.9rem;"><strong>Flagged:</strong> ${new Date(card.flagged_at).toLocaleString()}</p>
                     `;
                     
-                    // Action buttons
+                    // Action buttons (using data attributes instead of inline onclick)
                     const actionsDiv = document.createElement('div');
                     actionsDiv.style.cssText = 'flex-shrink:0;display:flex;flex-direction:column;gap:8px;';
-                    actionsDiv.innerHTML = `
-                        <button class="btn btn-primary" onclick="viewCard('${card.path}')" style="font-size:0.9rem;padding:6px 12px;">View</button>
-                        <button class="btn" onclick="downloadCard('${card.path}')" style="font-size:0.9rem;padding:6px 12px;background:#3498db;">Download</button>
-                        <button class="btn btn-danger" onclick="deleteProhibited('${card.path}')" style="font-size:0.9rem;padding:6px 12px;">Delete</button>
-                    `;
+                    const viewBtn = document.createElement('button');
+                    viewBtn.className = 'btn btn-primary';
+                    viewBtn.style.cssText = 'font-size:0.9rem;padding:6px 12px;';
+                    viewBtn.textContent = 'View';
+                    viewBtn.dataset.path = card.path;
+                    viewBtn.onclick = () => viewCard(card.path);
+                    
+                    const downloadBtn = document.createElement('button');
+                    downloadBtn.className = 'btn';
+                    downloadBtn.style.cssText = 'font-size:0.9rem;padding:6px 12px;background:#3498db;';
+                    downloadBtn.textContent = 'Download';
+                    downloadBtn.dataset.path = card.path;
+                    downloadBtn.onclick = () => downloadCard(card.path);
+                    
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.className = 'btn btn-danger';
+                    deleteBtn.style.cssText = 'font-size:0.9rem;padding:6px 12px;';
+                    deleteBtn.textContent = 'Delete';
+                    deleteBtn.dataset.path = card.path;
+                    deleteBtn.onclick = () => deleteProhibited(card.path);
+                    
+                    actionsDiv.appendChild(viewBtn);
+                    actionsDiv.appendChild(downloadBtn);
+                    actionsDiv.appendChild(deleteBtn);
                     
                     cardDiv.appendChild(imgDiv);
                     cardDiv.appendChild(infoDiv);
@@ -3282,6 +3306,14 @@ DASHBOARD_HTML = """
                 loading.style.display = 'none';
                 list.innerHTML = '<div class="empty">Error loading prohibited cards</div>';
             }
+        }
+
+        function parseCardPath(path) {
+            // Helper function to parse card path into folder and filename
+            const parts = path.split('/');
+            const filename = parts[parts.length - 1];
+            const folder = parts[parts.length - 2];
+            return { folder, filename };
         }
 
         async function deleteProhibited(path) {
@@ -3299,17 +3331,13 @@ DASHBOARD_HTML = """
 
         function viewCard(path) {
             // Navigate to card detail page
-            const parts = path.split('/');
-            const filename = parts[parts.length - 1];
-            const folder = parts[parts.length - 2];
-            window.location.href = `/api/cards/${folder}/${filename}`;
+            const { folder, filename } = parseCardPath(path);
+            window.location.href = `/api/cards/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
         }
 
         function downloadCard(path) {
-            const parts = path.split('/');
-            const filename = parts[parts.length - 1];
-            const folder = parts[parts.length - 2];
-            window.location.href = `/cards/${folder}/${filename}`;
+            const { folder, filename } = parseCardPath(path);
+            window.location.href = `/cards/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
         }
 
         async function loadTags() {
