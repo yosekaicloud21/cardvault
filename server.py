@@ -572,7 +572,7 @@ class CardIndexDB:
                     FROM prohibited_deleted
                 """)
                 cur.execute("DROP TABLE IF EXISTS prohibited_deleted")
-            except:
+            except sqlite3.OperationalError:
                 pass  # Table might not exist or already migrated
 
             # Ignored duplicates
@@ -873,7 +873,7 @@ class CardIndexDB:
         """Add a card to quarantine for manual review."""
         with self._cursor() as cur:
             cur.execute(
-                "INSERT OR IGNORE INTO quarantine (path, matches, status, reason, quarantined_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO quarantine (path, matches, status, reason, quarantined_at) VALUES (?, ?, ?, ?, ?)",
                 (path, json.dumps(matches), status, reason, datetime.utcnow().isoformat())
             )
 

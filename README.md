@@ -143,7 +143,7 @@ Windows drive letters (like `C:`) are automatically detected and handled correct
 
 ## Content Quarantine System
 
-CardVault uses smart context-aware content filtering to flag cards for manual review. **Cards are NEVER automatically deleted** - they remain fully accessible and indexed, but flagged items appear in the Quarantine tab for your review.
+CardVault uses smart context-aware content filtering to flag cards for manual review. **Cards are never automatically deleted by the system** - they remain fully accessible and indexed, but flagged items appear in the Quarantine tab for your review and manual action.
 
 ### How It Works
 
