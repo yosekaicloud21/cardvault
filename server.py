@@ -2499,6 +2499,7 @@ DASHBOARD_HTML = """
                 <div class="actions" style="margin-bottom:20px;">
                     <button class="btn btn-danger" onclick="cleanDuplicates('first')" id="clean-first-btn">Delete Duplicates (Keep First)</button>
                     <button class="btn btn-danger" onclick="cleanDuplicates('largest')" id="clean-largest-btn">Delete Duplicates (Keep Largest)</button>
+                    <button class="btn btn-danger" onclick="cleanDuplicatesWithDescriptionCheck('first')" id="clean-desc-btn" style="background:#e67e22;">Delete Only Matching Descriptions (Keep First)</button>
                 </div>
                 <div id="duplicates-list"></div>
                 <div id="duplicates-loading" class="loading">Loading duplicates...</div>
@@ -3170,6 +3171,21 @@ DASHBOARD_HTML = """
             } catch (e) { showToast('Error cleaning duplicates', true); }
             document.getElementById('clean-first-btn').disabled = false;
             document.getElementById('clean-largest-btn').disabled = false;
+        }
+
+        async function cleanDuplicatesWithDescriptionCheck(keep) {
+            if (!confirm(`Delete duplicate files with IDENTICAL descriptions only, keeping the ${keep} copy?`)) return;
+            document.getElementById('clean-desc-btn').disabled = true;
+            try {
+                const res = await fetch(`/api/duplicates/clean?keep=${keep}&check_description=true`, { method: 'DELETE' });
+                const data = await res.json();
+                showToast(`Deleted ${data.deleted_count} duplicate files with matching descriptions`);
+                loadDuplicates();
+                loadStats();
+            } catch (e) { 
+                showToast('Error cleaning duplicates', true); 
+            }
+            document.getElementById('clean-desc-btn').disabled = false;
         }
 
         async function loadProhibited() {
@@ -4473,7 +4489,8 @@ async def ignore_duplicate_group(paths: List[str] = Query(..., description="Path
 @app.delete("/api/duplicates/clean")
 async def clean_duplicates(
     keep: str = Query("first", description="Which to keep: 'first' or 'largest'"),
-    type: str = Query("all", description="Which duplicates: 'content', 'image', or 'all'")
+    type: str = Query("all", description="Which duplicates: 'content', 'image', or 'all'"),
+    check_description: bool = Query(False, description="Only delete if descriptions match")
 ):
     """Delete duplicate files, keeping one copy of each."""
     if not DETECT_DUPLICATES:
@@ -4488,6 +4505,27 @@ async def clean_duplicates(
         valid_paths = [p for p in paths if p not in already_deleted and os.path.exists(p)]
         if len(valid_paths) <= 1:
             return
+
+        # If check_description is True, only process if ALL descriptions match
+        if check_description:
+            descriptions = []
+            for path in valid_paths:
+                entry = index.get_card_by_path(path)
+                if entry:
+                    # Use description_preview from database
+                    descriptions.append(entry.description_preview or '')
+                else:
+                    # Try to extract from metadata as fallback
+                    metadata = index.extract_metadata(path)
+                    if metadata and 'data' in metadata:
+                        desc = metadata['data'].get('description', '')
+                        descriptions.append(desc or '')
+                    else:
+                        descriptions.append('')
+            
+            # If descriptions differ, skip this group
+            if len(set(descriptions)) > 1:
+                return
 
         if keep == "largest":
             paths_with_size = [(p, os.path.getsize(p)) for p in valid_paths]
