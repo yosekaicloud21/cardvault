@@ -367,7 +367,8 @@ def check_quarantine_content(tags: List[str], description: str = "", first_mes: 
     """
     Check if content should be quarantined based on:
     1. Blocked tag words appearing in description/first_mes
-    2. Age mentions under 18
+    2. Blocked words in actual tags
+    3. Age mentions under 18
     
     Returns: (should_quarantine, matches, reason)
     """
@@ -3322,8 +3323,8 @@ DASHBOARD_HTML = """
                                 Flagged: ${new Date(card.quarantined_at).toLocaleString()}
                             </div>
                             <div style="display:flex;gap:8px;">
-                                <button class="btn btn-sm" onclick="approveCard('${card.path.replace(/'/g, "\\'")}'); return false;" style="background:#27ae60;flex:1;">Approve</button>
-                                <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/'/g, "\\'")}'); return false;" style="flex:1;">Delete</button>
+                                <button class="btn btn-sm" onclick="approveCard('${card.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'); return false;" style="background:#27ae60;flex:1;">Approve</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'); return false;" style="flex:1;">Delete</button>
                             </div>
                         </div>
                     `;
@@ -3359,7 +3360,9 @@ DASHBOARD_HTML = """
                 if (res.ok) {
                     showToast('Card deleted');
                     // Also remove from quarantine table
-                    await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' }).catch(() => {});
+                    await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' }).catch((err) => {
+                        console.warn('Failed to cleanup quarantine entry:', err);
+                    });
                     loadQuarantine();
                     loadStats();
                 } else {
@@ -4493,10 +4496,12 @@ async def delete_all_quarantine():
             paths = [row[0] for row in c.fetchall()]
             
             deleted_count = 0
+            db_cleaned = 0
             for path in paths:
                 try:
                     # Delete from main cards table
                     c.execute("DELETE FROM cards WHERE path = ?", (path,))
+                    db_cleaned += 1
                     # Delete file from disk
                     if os.path.exists(path):
                         os.remove(path)
@@ -4508,7 +4513,7 @@ async def delete_all_quarantine():
             c.execute("DELETE FROM quarantine")
             conn.commit()
             
-            return {"success": True, "deleted_count": deleted_count}
+            return {"success": True, "deleted_count": deleted_count, "db_cleaned": db_cleaned, "total_paths": len(paths)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
