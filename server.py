@@ -3228,6 +3228,11 @@ DASHBOARD_HTML = """
                 for (const card of data.cards) {
                     const downloadUrl = `/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}`;
                     const viewUrl = `/api/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}`;
+                    const escapedName = escapeHtml(card.name);
+                    const escapedCreator = escapeHtml(card.creator);
+                    const escapedReason = escapeHtml(card.prohibited_reason);
+                    // Escape for use in JavaScript string context (double escaping for onclick)
+                    const jsEscapedName = escapedName.replace(/'/g, "\\'").replace(/"/g, '\\"');
                     
                     html += `
                         <div class="card-item" style="border:2px solid #e74c3c;">
@@ -3235,13 +3240,13 @@ DASHBOARD_HTML = """
                                 <img src="${downloadUrl}" style="width:120px;height:120px;object-fit:cover;border-radius:5px;" 
                                      onerror="this.style.display='none'">
                                 <div style="flex:1;">
-                                    <h3 style="margin:0 0 5px 0;">${escapeHtml(card.name)}</h3>
+                                    <h3 style="margin:0 0 5px 0;">${escapedName}</h3>
                                     <div style="color:#888;font-size:0.9em;margin-bottom:8px;">
-                                        by ${escapeHtml(card.creator)}
+                                        by ${escapedCreator}
                                     </div>
                                     <div style="background:#4a1a1a;padding:8px;border-radius:4px;margin-bottom:10px;">
                                         <strong style="color:#e74c3c;">⚠ Flagged:</strong> 
-                                        <span style="color:#fff;">${escapeHtml(card.prohibited_reason)}</span>
+                                        <span style="color:#fff;">${escapedReason}</span>
                                     </div>
                                     ${card.tags.slice(0, 5).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}
                                     <div style="margin-top:10px;">
@@ -3257,7 +3262,7 @@ DASHBOARD_HTML = """
                                                 style="background:#2ecc71;margin-right:5px;">
                                             Approve (Not Prohibited)
                                         </button>
-                                        <button class="btn btn-danger" onclick="deleteProhibited(${card.id}, '${escapeHtml(card.name)}')">
+                                        <button class="btn btn-danger" onclick="deleteProhibited(${card.id}, '${jsEscapedName}')">
                                             Delete Permanently
                                         </button>
                                     </div>
@@ -4354,7 +4359,7 @@ async def debug_paths(
 @app.get("/api/prohibited")
 async def get_prohibited_cards(limit: int = 100, offset: int = 0):
     """Get list of prohibited cards (not deleted, just flagged)."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(index.db_path) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         
@@ -4401,7 +4406,7 @@ async def get_prohibited_cards(limit: int = 100, offset: int = 0):
 @app.delete("/api/prohibited/{card_id}")
 async def delete_prohibited_card(card_id: int):
     """Manually delete a prohibited card."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(index.db_path) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         
@@ -4432,7 +4437,7 @@ async def delete_prohibited_card(card_id: int):
 @app.post("/api/prohibited/{card_id}/approve")
 async def approve_prohibited_card(card_id: int):
     """Approve a prohibited card (unmark it)."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(index.db_path) as conn:
         c = conn.cursor()
         
         c.execute("SELECT id FROM cards WHERE id = ? AND prohibited = 1", (card_id,))
