@@ -877,29 +877,53 @@ class CardIndexDB:
                 (path, json.dumps(matches), status, reason, datetime.utcnow().isoformat())
             )
 
+    def _safe_extract_folder_file(self, path: str) -> Tuple[str, str]:
+        """Safely extract folder and filename from path."""
+        try:
+            if not path:
+                return ("Unknown", "Unknown")
+            p = Path(path)
+            return (p.parent.name or "Unknown", p.name or "Unknown")
+        except Exception:
+            return ("Unknown", "Unknown")
+
     def get_quarantine(self, limit: int = 100) -> List[dict]:
         """Get list of quarantined cards."""
         with self._cursor() as cur:
-            cur.execute(
-                "SELECT path, matches, status, reason, quarantined_at FROM quarantine ORDER BY id DESC LIMIT ?",
-                (limit,)
-            )
-            return [
-                {
-                    "path": row[0], 
-                    "matches": json.loads(row[1]), 
+            cur.execute("""
+                SELECT q.path, q.matches, q.status, q.reason, q.quarantined_at,
+                       c.folder, c.file, c.name, c.creator
+                FROM quarantine q
+                LEFT JOIN cards c ON q.path = c.path
+                ORDER BY q.id DESC LIMIT ?
+            """, (limit,))
+            results = []
+            for row in cur.fetchall():
+                folder, file = self._safe_extract_folder_file(row[0])
+                results.append({
+                    "path": row[0],
+                    "matches": json.loads(row[1]),
                     "status": row[2],
                     "reason": row[3],
-                    "quarantined_at": row[4]
-                }
-                for row in cur.fetchall()
-            ]
+                    "quarantined_at": row[4],
+                    "folder": row[5] if row[5] else folder,
+                    "file": row[6] if row[6] else file,
+                    "name": row[7] if row[7] else "",
+                    "creator": row[8] if row[8] else "Unknown"
+                })
+            return results
 
     def get_quarantine_count(self) -> int:
         """Get count of quarantined cards."""
         with self._cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM quarantine")
             return cur.fetchone()[0]
+
+    def get_all_quarantine_paths(self) -> List[str]:
+        """Get all quarantine card paths for bulk operations."""
+        with self._cursor() as cur:
+            cur.execute("SELECT path FROM quarantine")
+            return [row[0] for row in cur.fetchall()]
 
     def index_card(self, filepath: str) -> Optional[CardEntry]:
         """Index a single card file."""
@@ -1230,6 +1254,8 @@ class CardIndexDB:
                 os.remove(path)
             with self._cursor() as cur:
                 cur.execute("DELETE FROM cards WHERE path = ?", (path,))
+                # Also clean up quarantine records
+                cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
             if path in self.image_hash_objects:
                 del self.image_hash_objects[path]
             return True
@@ -2536,6 +2562,9 @@ DASHBOARD_HTML = """
             <div class="section">
                 <h2>Quarantine</h2>
                 <p style="color:#888;margin-bottom:15px;">Flagged cards for manual review - no files are deleted automatically</p>
+                <div class="actions" style="margin-bottom:15px;">
+                    <button class="btn btn-danger" onclick="deleteAllQuarantinedCards()">Delete All</button>
+                </div>
                 <div id="quarantine-list"></div>
                 <div id="quarantine-loading" class="loading">Loading...</div>
             </div>
@@ -3230,25 +3259,26 @@ DASHBOARD_HTML = """
                 data.cards.forEach(card => {
                     const statusColor = card.status === 'block' ? '#e74c3c' : '#f39c12';
                     const statusLabel = card.status === 'block' ? 'HIGH PRIORITY' : 'REVIEW';
+                    const matchesHtml = card.matches.map(m => '<p style="font-family:monospace;font-size:0.8rem;color:#e74c3c;">' + m + '</p>').join('');
                     
                     html += `
-                        <div class="card" style="border-left:4px solid ${statusColor}">
-                            <div style="font-size:13px;color:#555;margin-bottom:8px;">
-                                ${card.path}
-                                <span style="background:${statusColor};color:white;padding:2px 8px;border-radius:3px;font-size:11px;margin-left:8px;">${statusLabel}</span>
+                        <div class="card" style="position:relative;" data-folder="${encodeURIComponent(card.folder)}" data-file="${encodeURIComponent(card.file)}">
+                            <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}" 
+                                 alt="${card.name || 'Unknown'}" 
+                                 loading="lazy"
+                                 onclick="openCardEl(this.parentElement)"
+                                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/></svg>'">
+                            <div class="card-info">
+                                <h4>${card.name || 'Unknown'}</h4>
+                                <p>${card.creator || 'Unknown'}</p>
                             </div>
-                            <div style="font-size:12px;color:#888;margin-bottom:4px;">
-                                <strong>Reason:</strong> ${card.reason || 'N/A'}
-                            </div>
-                            <div style="font-size:12px;color:#888;margin-bottom:8px;word-break:break-word;">
-                                <strong>Matches:</strong> ${card.matches.join(', ')}
-                            </div>
-                            <div style="font-size:11px;color:#aaa;margin-bottom:8px;">
-                                Flagged: ${new Date(card.quarantined_at).toLocaleString()}
-                            </div>
-                            <div style="display:flex;gap:8px;">
-                                <button class="btn btn-sm" onclick="viewCard('${card.path.replace(/'/g, "\\'")}')">View Card</button>
+                            <div class="actions" style="margin-top:10px;">
+                                <button class="btn btn-sm" onclick="approveQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Approve</button>
                                 <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Delete</button>
+                            </div>
+                            <div style="background:#1a1a2e;padding:10px;border-radius:6px;margin-top:10px;">
+                                <p style="font-size:0.85rem;color:#888;">Matched content:</p>
+                                ${matchesHtml}
                             </div>
                         </div>
                     `;
@@ -3274,6 +3304,39 @@ DASHBOARD_HTML = """
                 }
             } catch (e) {
                 showToast('Error deleting card', true);
+            }
+        }
+
+        async function approveQuarantinedCard(path) {
+            if (!confirm(`Approve this card?\\n\\n${path}\\n\\nThis will remove it from quarantine but keep it in the index.`)) return;
+            try {
+                const res = await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('Card approved');
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to approve card', true);
+                }
+            } catch (e) {
+                showToast('Error approving card', true);
+            }
+        }
+
+        async function deleteAllQuarantinedCards() {
+            if (!confirm('Delete ALL cards in quarantine permanently?\\n\\nThis action cannot be undone!')) return;
+            try {
+                const res = await fetch('/api/quarantine/delete-all', { method: 'DELETE' });
+                if (res.ok) {
+                    const data = await res.json();
+                    showToast(`Deleted ${data.deleted_count} cards`);
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to delete quarantined cards', true);
+                }
+            } catch (e) {
+                showToast('Error deleting quarantined cards', true);
             }
         }
 
@@ -4335,6 +4398,43 @@ async def get_quarantine():
         "total_quarantined": index.get_quarantine_count(),
         "cards": index.get_quarantine(100)
     }
+
+
+@app.post("/api/quarantine/approve")
+async def approve_quarantine_card(path: str = Query(...)):
+    """Approve a quarantined card - removes from quarantine, keeps in index."""
+    with index._cursor() as cur:
+        cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+        if cur.rowcount > 0:
+            return {"success": True, "path": path, "action": "approved"}
+        else:
+            raise HTTPException(status_code=404, detail="Card not found in quarantine")
+
+
+@app.delete("/api/quarantine/delete-all")
+async def delete_all_quarantined():
+    """Delete all cards in quarantine."""
+    paths = index.get_all_quarantine_paths()
+    deleted = 0
+    failed_paths = []
+    
+    for path in paths:
+        if index.delete_card(path):
+            deleted += 1
+        else:
+            failed_paths.append(path)
+    
+    # Clean up quarantine records for paths that no longer exist
+    if failed_paths:
+        for path in failed_paths:
+            if not os.path.exists(path):
+                try:
+                    with index._cursor() as cur:
+                        cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+                except Exception as e:
+                    logger.error(f"Failed to clean quarantine record for {path}: {e}")
+    
+    return {"success": True, "deleted_count": deleted, "failed_count": len(failed_paths)}
 
 
 # Keep old endpoint for backwards compatibility
