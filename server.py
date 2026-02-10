@@ -3324,7 +3324,7 @@ DASHBOARD_HTML = """
         }
 
         async function deleteQuarantinedCard(path) {
-            if (!confirm(`Delete this card permanently?\n\n${path}`)) return;
+            if (!confirm(`Delete this card permanently?\\n\\n${path}`)) return;
             try {
                 const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
                 if (res.ok) {
@@ -3366,9 +3366,9 @@ DASHBOARD_HTML = """
                     return;
                 }
                 
-                if (!confirm(`Delete ALL ${count} card${count !== 1 ? 's' : ''} in quarantine?\n\nThis action cannot be undone!`)) return;
+                if (!confirm(`Delete ALL ${count} card${count !== 1 ? 's' : ''} in quarantine?\\n\\nThis action cannot be undone!`)) return;
             } catch (e) {
-                if (!confirm('Delete ALL cards in quarantine?\n\nThis action cannot be undone!')) return;
+                if (!confirm('Delete ALL cards in quarantine?\\n\\nThis action cannot be undone!')) return;
             }
             
             const btn = document.getElementById('delete-all-quarantine-btn');
