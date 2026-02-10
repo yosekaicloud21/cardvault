@@ -3309,7 +3309,7 @@ DASHBOARD_HTML = """
         }
 
         async function approveQuarantinedCard(path) {
-            if (!confirm(`Approve this card?\n\n${path}\n\nThis will remove it from quarantine but keep it in the index.`)) return;
+            if (!confirm(`Approve this card?\\n\\n${path}\\n\\nThis will remove it from quarantine but keep it in the index.`)) return;
             try {
                 const res = await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' });
                 if (res.ok) {
@@ -3325,7 +3325,7 @@ DASHBOARD_HTML = """
         }
 
         async function deleteAllQuarantinedCards() {
-            if (!confirm('Delete ALL cards in quarantine permanently?\n\nThis action cannot be undone!')) return;
+            if (!confirm('Delete ALL cards in quarantine permanently?\\n\\nThis action cannot be undone!')) return;
             try {
                 const res = await fetch('/api/quarantine/delete-all', { method: 'DELETE' });
                 if (res.ok) {
