@@ -926,6 +926,37 @@ class CardIndexDB:
         with self._cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM quarantine")
             return cur.fetchone()[0]
+    
+    def remove_from_quarantine(self, path: str) -> bool:
+        """Remove a card from quarantine (approve it)."""
+        try:
+            with self._cursor() as cur:
+                cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error removing from quarantine: {e}")
+            return False
+    
+    def get_all_quarantine_paths(self) -> List[str]:
+        """Get all paths of quarantined cards."""
+        with self._cursor() as cur:
+            cur.execute("SELECT path FROM quarantine")
+            return [row[0] for row in cur.fetchall()]
+    
+    def delete_all_quarantined_cards(self) -> int:
+        """Delete all quarantined cards from disk and database. Returns count of deleted cards."""
+        deleted_count = 0
+        paths = self.get_all_quarantine_paths()
+        
+        for path in paths:
+            if self.delete_card(path):
+                deleted_count += 1
+        
+        # Clean up quarantine table
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM quarantine")
+        
+        return deleted_count
 
     def index_card(self, filepath: str) -> Optional[CardEntry]:
         """Index a single card file."""
@@ -2562,6 +2593,9 @@ DASHBOARD_HTML = """
             <div class="section">
                 <h2>Quarantine</h2>
                 <p style="color:#888;margin-bottom:15px;">Flagged cards for manual review - no files are deleted automatically</p>
+                <div style="margin-bottom:15px;">
+                    <button class="btn btn-danger" onclick="deleteAllQuarantine()" id="delete-all-quarantine-btn">Delete All</button>
+                </div>
                 <div id="quarantine-list"></div>
                 <div id="quarantine-loading" class="loading">Loading...</div>
             </div>
@@ -3259,7 +3293,7 @@ DASHBOARD_HTML = """
                     
                     html += `
                         <div class="card" style="border-left:4px solid ${statusColor}">
-                            <div style="font-size:13px;color:#555;margin-bottom:8px;">
+                            <div style="font-size:13px;color:#555;margin-bottom:8px;cursor:pointer;" onclick="viewCard('${card.path.replace(/'/g, "\\'")}')">
                                 ${card.path}
                                 <span style="background:${statusColor};color:white;padding:2px 8px;border-radius:3px;font-size:11px;margin-left:8px;">${statusLabel}</span>
                             </div>
@@ -3273,7 +3307,7 @@ DASHBOARD_HTML = """
                                 Flagged: ${new Date(card.quarantined_at).toLocaleString()}
                             </div>
                             <div style="display:flex;gap:8px;">
-                                <button class="btn btn-sm" onclick="viewCard('${card.path.replace(/'/g, "\\'")}')">View Card</button>
+                                <button class="btn btn-sm" onclick="approveQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Approve</button>
                                 <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Delete</button>
                             </div>
                         </div>
@@ -3301,6 +3335,44 @@ DASHBOARD_HTML = """
             } catch (e) {
                 showToast('Error deleting card', true);
             }
+        }
+        
+        async function approveQuarantinedCard(path) {
+            try {
+                const res = await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('Card approved and removed from quarantine');
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to approve card', true);
+                }
+            } catch (e) {
+                showToast('Error approving card', true);
+            }
+        }
+        
+        async function deleteAllQuarantine() {
+            if (!confirm('Delete ALL cards in quarantine?\n\nThis action cannot be undone!')) return;
+            
+            const btn = document.getElementById('delete-all-quarantine-btn');
+            btn.disabled = true;
+            
+            try {
+                const res = await fetch('/api/quarantine/delete-all', { method: 'DELETE' });
+                if (res.ok) {
+                    const data = await res.json();
+                    showToast(`Deleted ${data.deleted_count} cards from quarantine`);
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to delete cards', true);
+                }
+            } catch (e) {
+                showToast('Error deleting cards', true);
+            }
+            
+            btn.disabled = false;
         }
 
         async function viewCard(path) {
@@ -4377,6 +4449,22 @@ async def delete_prohibited_card(path: str = Query(...)):
         return {"success": True, "deleted": path}
     else:
         raise HTTPException(status_code=404, detail="Card not found")
+
+
+@app.post("/api/quarantine/approve")
+async def approve_quarantine_card(path: str = Query(...)):
+    """Approve a quarantined card (remove from quarantine, keep in index)."""
+    if index.remove_from_quarantine(path):
+        return {"success": True, "approved": path}
+    else:
+        raise HTTPException(status_code=404, detail="Card not found in quarantine")
+
+
+@app.delete("/api/quarantine/delete-all")
+async def delete_all_quarantine():
+    """Delete all quarantined cards."""
+    deleted_count = index.delete_all_quarantined_cards()
+    return {"success": True, "deleted_count": deleted_count}
 
 
 @app.get("/api/duplicates")
