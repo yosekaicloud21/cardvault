@@ -162,6 +162,12 @@ ADULT_AGE_PATTERNS = [
 # Legacy combined list for backwards compatibility
 BLOCKED_DESCRIPTION_PATTERNS = BLOCKED_DESCRIPTION_PATTERNS_STRICT + AGE_PATTERNS_CONTEXT
 
+# Pre-compiled regex patterns for BLOCKED_TAGS_EXACT (for efficient word boundary matching)
+BLOCKED_TAGS_EXACT_PATTERNS = [
+    re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE)
+    for word in BLOCKED_TAGS_EXACT
+]
+
 # NSFW tag indicators
 NSFW_TAGS = {
     "nsfw", "explicit", "adult", "18+", "mature", "r18", "r-18",
@@ -249,11 +255,8 @@ def check_prohibited_description(description: str) -> Tuple[bool, set]:
 
     blocked_found = set()
     
-    # Check for exact word matches from BLOCKED_TAGS_EXACT
-    description_lower = description.lower()
-    for blocked_word in BLOCKED_TAGS_EXACT:
-        # Use word boundary matching to avoid partial matches
-        pattern = re.compile(r'\b' + re.escape(blocked_word) + r'\b', re.IGNORECASE)
+    # Check for exact word matches from BLOCKED_TAGS_EXACT using pre-compiled patterns
+    for pattern in BLOCKED_TAGS_EXACT_PATTERNS:
         match = pattern.search(description)
         if match:
             start = max(0, match.start() - 20)
@@ -308,9 +311,8 @@ def check_prohibited_content_smart(tags: List[str], description: str = "", first
     if tag_prohibited:
         return "block", tag_matches, "Prohibited tags found"
     
-    # Check for exact blocked words in description text
-    for blocked_word in BLOCKED_TAGS_EXACT:
-        pattern = re.compile(r'\b' + re.escape(blocked_word) + r'\b', re.IGNORECASE)
+    # Check for exact blocked words in description text using pre-compiled patterns
+    for pattern in BLOCKED_TAGS_EXACT_PATTERNS:
         match = pattern.search(full_text)
         if match:
             start = max(0, match.start() - 30)
@@ -3353,7 +3355,21 @@ DASHBOARD_HTML = """
         }
         
         async function deleteAllQuarantine() {
-            if (!confirm('Delete ALL cards in quarantine?\n\nThis action cannot be undone!')) return;
+            // First, fetch the current count to show in confirmation
+            try {
+                const res = await fetch('/api/quarantine');
+                const data = await res.json();
+                const count = data.cards.length;
+                
+                if (count === 0) {
+                    showToast('No cards in quarantine to delete');
+                    return;
+                }
+                
+                if (!confirm(`Delete ALL ${count} card${count !== 1 ? 's' : ''} in quarantine?\n\nThis action cannot be undone!`)) return;
+            } catch (e) {
+                if (!confirm('Delete ALL cards in quarantine?\n\nThis action cannot be undone!')) return;
+            }
             
             const btn = document.getElementById('delete-all-quarantine-btn');
             btn.disabled = true;
