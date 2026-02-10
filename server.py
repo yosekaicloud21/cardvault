@@ -877,6 +877,16 @@ class CardIndexDB:
                 (path, json.dumps(matches), status, reason, datetime.utcnow().isoformat())
             )
 
+    def _safe_extract_folder_file(self, path: str) -> Tuple[str, str]:
+        """Safely extract folder and filename from path."""
+        try:
+            if not path:
+                return ("Unknown", "Unknown")
+            p = Path(path)
+            return (p.parent.name or "Unknown", p.name or "Unknown")
+        except Exception:
+            return ("Unknown", "Unknown")
+
     def get_quarantine(self, limit: int = 100) -> List[dict]:
         """Get list of quarantined cards."""
         with self._cursor() as cur:
@@ -887,20 +897,21 @@ class CardIndexDB:
                 LEFT JOIN cards c ON q.path = c.path
                 ORDER BY q.id DESC LIMIT ?
             """, (limit,))
-            return [
-                {
+            results = []
+            for row in cur.fetchall():
+                folder, file = self._safe_extract_folder_file(row[0])
+                results.append({
                     "path": row[0],
                     "matches": json.loads(row[1]),
                     "status": row[2],
                     "reason": row[3],
                     "quarantined_at": row[4],
-                    "folder": row[5] if row[5] else (Path(row[0]).parent.name if row[0] else "Unknown"),
-                    "file": row[6] if row[6] else (Path(row[0]).name if row[0] else "Unknown"),
+                    "folder": row[5] if row[5] else folder,
+                    "file": row[6] if row[6] else file,
                     "name": row[7] if row[7] else "",
                     "creator": row[8] if row[8] else "Unknown"
-                }
-                for row in cur.fetchall()
-            ]
+                })
+            return results
 
     def get_quarantine_count(self) -> int:
         """Get count of quarantined cards."""
