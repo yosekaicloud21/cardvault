@@ -3273,7 +3273,6 @@ DASHBOARD_HTML = """
                                 <p>${card.creator || 'Unknown'}</p>
                             </div>
                             <div class="actions" style="margin-top:10px;">
-                                <span class="tag" style="background:${statusColor};">${statusLabel}</span>
                                 <button class="btn btn-sm" onclick="approveQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Approve</button>
                                 <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Delete</button>
                             </div>
