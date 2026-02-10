@@ -894,8 +894,8 @@ class CardIndexDB:
                     "status": row[2],
                     "reason": row[3],
                     "quarantined_at": row[4],
-                    "folder": row[5] if row[5] else Path(row[0]).parent.name,
-                    "file": row[6] if row[6] else Path(row[0]).name,
+                    "folder": row[5] if row[5] else (Path(row[0]).parent.name if row[0] else "Unknown"),
+                    "file": row[6] if row[6] else (Path(row[0]).name if row[0] else "Unknown"),
                     "name": row[7] if row[7] else "",
                     "creator": row[8] if row[8] else "Unknown"
                 }
@@ -1243,6 +1243,8 @@ class CardIndexDB:
                 os.remove(path)
             with self._cursor() as cur:
                 cur.execute("DELETE FROM cards WHERE path = ?", (path,))
+                # Also clean up quarantine records
+                cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
             if path in self.image_hash_objects:
                 del self.image_hash_objects[path]
             return True
@@ -4403,10 +4405,25 @@ async def delete_all_quarantined():
     """Delete all cards in quarantine."""
     paths = index.get_all_quarantine_paths()
     deleted = 0
+    failed_paths = []
+    
     for path in paths:
         if index.delete_card(path):
             deleted += 1
-    return {"success": True, "deleted_count": deleted}
+        else:
+            failed_paths.append(path)
+    
+    # Clean up quarantine records for paths that no longer exist
+    if failed_paths:
+        for path in failed_paths:
+            if not os.path.exists(path):
+                try:
+                    with index._cursor() as cur:
+                        cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+                except Exception as e:
+                    logger.error(f"Failed to clean quarantine record for {path}: {e}")
+    
+    return {"success": True, "deleted_count": deleted, "failed_count": len(failed_paths)}
 
 
 # Keep old endpoint for backwards compatibility
