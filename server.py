@@ -119,7 +119,7 @@ BLOCKED_TAGS_EXACT = {
     "child", "children", "underage", "minor", "minors",
     "kid", "kids", "toddler", "infant", "preteen", "prepubescent",
     "young child", "little girl", "little boy", "cub", "cubs",
-    "pedophilia", "pedo", "cp", "csam", "jailbait", "incest"
+    "loli", "pedophilia", "pedo", "cp", "csam", "jailbait", "incest"
 }
 BLOCKED_PATTERNS = [re.compile(r'\bloli'), re.compile(r'\bshota'), re.compile(r'\brape')]
 
@@ -248,7 +248,20 @@ def check_prohibited_description(description: str) -> Tuple[bool, set]:
         return False, set()
 
     blocked_found = set()
+    
+    # Check for exact word matches from BLOCKED_TAGS_EXACT
+    description_lower = description.lower()
+    for blocked_word in BLOCKED_TAGS_EXACT:
+        # Use word boundary matching to avoid partial matches
+        pattern = re.compile(r'\b' + re.escape(blocked_word) + r'\b', re.IGNORECASE)
+        match = pattern.search(description)
+        if match:
+            start = max(0, match.start() - 20)
+            end = min(len(description), match.end() + 20)
+            snippet = description[start:end].replace('\n', ' ')
+            blocked_found.add(f"desc: ...{snippet}...")
 
+    # Check regex patterns
     for pattern in BLOCKED_DESCRIPTION_PATTERNS:
         match = pattern.search(description)
         if match:
@@ -294,6 +307,19 @@ def check_prohibited_content_smart(tags: List[str], description: str = "", first
     tag_prohibited, tag_matches = check_prohibited_tags(tags)
     if tag_prohibited:
         return "block", tag_matches, "Prohibited tags found"
+    
+    # Check for exact blocked words in description text
+    for blocked_word in BLOCKED_TAGS_EXACT:
+        pattern = re.compile(r'\b' + re.escape(blocked_word) + r'\b', re.IGNORECASE)
+        match = pattern.search(full_text)
+        if match:
+            start = max(0, match.start() - 30)
+            end = min(len(full_text), match.end() + 30)
+            snippet = full_text[start:end].replace('\n', ' ')
+            blocked_found.add(f"...{snippet}...")
+    
+    if blocked_found:
+        return "block", blocked_found, "Prohibited words found in description"
 
     # Check strict patterns - always block
     for pattern in BLOCKED_DESCRIPTION_PATTERNS_STRICT:
