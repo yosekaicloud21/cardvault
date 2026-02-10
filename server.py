@@ -3259,6 +3259,7 @@ DASHBOARD_HTML = """
                 data.cards.forEach(card => {
                     const statusColor = card.status === 'block' ? '#e74c3c' : '#f39c12';
                     const statusLabel = card.status === 'block' ? 'HIGH PRIORITY' : 'REVIEW';
+                    const matchesHtml = card.matches.map(m => '<p style="font-family:monospace;font-size:0.8rem;color:#e74c3c;">' + m + '</p>').join('');
                     
                     html += `
                         <div class="card" style="position:relative;" data-folder="${encodeURIComponent(card.folder)}" data-file="${encodeURIComponent(card.file)}">
@@ -3278,7 +3279,7 @@ DASHBOARD_HTML = """
                             </div>
                             <div style="background:#1a1a2e;padding:10px;border-radius:6px;margin-top:10px;">
                                 <p style="font-size:0.85rem;color:#888;">Matched content:</p>
-                                ${card.matches.map(m => `<p style="font-family:monospace;font-size:0.8rem;color:#e74c3c;">${m}</p>`).join('')}
+                                ${matchesHtml}
                             </div>
                         </div>
                     `;
